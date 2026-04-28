@@ -1,0 +1,45 @@
+# Medium-scale config: 100k per class. Use to quickly validate training works
+# end-to-end before committing to a full 8-hour run.
+#
+# Estimated wall time on RTX 4090 with BF16: ~5-10 minutes for 5 epochs.
+
+experiment_name: medium_v1
+
+# Data
+n_train_per_class: 50000
+n_val_per_class: 5000
+n_test_per_class: 5000
+seed: 42
+
+# Model (defaults match src/model.py)
+model:
+  surface_vocab_size: 50265
+  surface_max_len: 513
+  surface_pad_id: 1
+  lex_vocab_size: 24
+  lex_max_len: 129
+  ast_vocab_size: 100
+  ast_max_len: 257
+  d_surface: 384
+  d_abstract: 256
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+
+# Training
+train:
+  epochs: 5
+  batch_size: 64
+  lr: 2e-4
+  weight_decay: 1e-4
+  view_dropout_prob: 0.1
+  grad_clip: 1.0
+  warmup_steps: 200
+  loss_weights: [0.7, 0.1, 0.1, 0.1]   # main, S, L, A
+  use_bf16: true                        # mixed precision (4090 supports BF16)
+  num_workers: 2
+
+# Logging
+log_every: 50
+val_every_epoch: true
+save_best: true

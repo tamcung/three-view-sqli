@@ -1,0 +1,13 @@
+# Core deep learning
+torch>=2.1
+transformers>=4.30
+sqlglot>=25.0
+sqlparse>=0.4
+
+# Standard scientific stack
+numpy
+scikit-learn
+
+# Config + experiment management
+pyyaml
+tqdm

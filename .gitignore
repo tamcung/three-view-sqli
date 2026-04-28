@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Build artifacts
+lib/*.so
+lib/*.dll
+lib/*.dylib
+lib/*.lib
+lib/*.exp
+*.obj
+
+# Data and cache (too large for git)
+data/wafamole/*
+data/cache/*
+!data/.gitkeep
+!data/wafamole/.gitkeep
+!data/cache/.gitkeep
+
+# Results
+results/
+
+# IDE / OS noise
+.idea/
+.vscode/
+.DS_Store
+._.DS_Store
+*~
+*.swp
+
+# Notebooks
+.ipynb_checkpoints/
+
+# HuggingFace cache (if local)
+.cache/

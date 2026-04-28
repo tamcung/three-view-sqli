@@ -1,0 +1,11 @@
+LIBRARY libinjection
+EXPORTS
+    libinjection_version
+    libinjection_sqli_init
+    libinjection_sqli_tokenize
+    libinjection_sqli_fold
+    libinjection_sqli_check_fingerprint
+    libinjection_sqli_get_token
+    libinjection_sqli_callback
+    libinjection_sqli_fingerprint
+    libinjection_is_sqli
