@@ -175,8 +175,8 @@ def main():
         f"fusion={params['fusion_and_heads']/1e6:.2f}M")
 
     optimizer = torch.optim.AdamW(model.parameters(),
-                                   lr=cfg["train"]["lr"],
-                                   weight_decay=cfg["train"]["weight_decay"])
+                                   lr=float(cfg["train"]["lr"]),
+                                   weight_decay=float(cfg["train"]["weight_decay"]))
 
     # Linear warmup, cosine decay (simple scheduler)
     total_steps = cfg["train"]["epochs"] * math.ceil(len(train_ds) / bs)
