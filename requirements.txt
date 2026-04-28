@@ -11,3 +11,4 @@ scikit-learn
 # Config + experiment management
 pyyaml
 tqdm
+faker
