@@ -36,6 +36,67 @@ from src.libinjection_wrapper import is_sqli as libinj_is_sqli
 from train import wilson_ci, binary_metrics, evaluate as model_evaluate
 
 
+# ============================================================
+# Strict metric: recall at a fixed false-positive rate
+# ============================================================
+def recall_at_fpr(scores: np.ndarray, labels: np.ndarray, target_fpr: float) -> dict:
+    """Find the threshold that yields ≤ target_fpr on negatives, then report
+    recall on positives at that threshold.
+
+    For WAFs: business cost of false positives is high, so the operationally
+    meaningful question is "if I allow at most X% benign false alarms, how many
+    attacks do I catch?"
+    """
+    # Negative scores → find threshold
+    neg = scores[labels == 0]
+    pos = scores[labels == 1]
+    if len(neg) == 0 or len(pos) == 0:
+        return {"target_fpr": target_fpr, "actual_fpr": None,
+                "recall": None, "threshold": None}
+    # Threshold = the (1 - target_fpr) quantile of negative scores
+    # Anything above this threshold is predicted positive (FP for negatives)
+    k = max(1, int(len(neg) * target_fpr))
+    threshold = float(np.partition(neg, -k)[-k])
+    fp = int((neg > threshold).sum())
+    tp = int((pos > threshold).sum())
+    actual_fpr = fp / len(neg)
+    recall = tp / len(pos)
+    return {
+        "target_fpr": target_fpr,
+        "actual_fpr": actual_fpr,
+        "threshold": threshold,
+        "recall": recall,
+        "tp": tp, "fn": int(len(pos) - tp),
+        "fp": fp, "tn": int(len(neg) - fp),
+    }
+
+
+@torch.no_grad()
+def collect_scores(model, loader, device, use_bf16: bool):
+    """Run model and return raw logits per view + labels (for strict metrics)."""
+    model.eval()
+    sc = {k: [] for k in ("main", "S", "L", "A")}
+    labels_all = []
+    autocast_kw = {"dtype": torch.bfloat16, "enabled": use_bf16}
+    for batch in loader:
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu", **autocast_kw):
+            out = model(
+                batch["surface_ids"], batch["surface_mask"],
+                batch["lex_ids"], batch["lex_mask"],
+                batch["ast_ids"], batch["ast_mask"],
+                batch["ast_valid"],
+                view_dropout_prob=0.0,
+            )
+        sc["main"].append(out["p_main"].float().cpu().numpy())
+        sc["S"].append(out["p_S"].float().cpu().numpy())
+        sc["L"].append(out["p_L"].float().cpu().numpy())
+        sc["A"].append(out["p_A"].float().cpu().numpy())
+        labels_all.append(batch["label"].cpu().numpy())
+    return ({k: np.concatenate(v) for k, v in sc.items()},
+            np.concatenate(labels_all))
+
+
 def evaluate_libinjection(test_jsonl: Path) -> dict:
     """Run libinjection on every test sample, compute metrics."""
     import json as _json
@@ -124,6 +185,20 @@ def main():
         print(f"  {view:6s} F1={m['f1']:.4f}  P={m['precision']:.4f}  R={m['recall']:.4f}  "
               f"Acc={m['accuracy']:.4f}  CI[{m['acc_ci_low']:.4f}, {m['acc_ci_high']:.4f}]")
 
+    # Strict metrics: recall at low FPR (the operationally meaningful WAF metric)
+    print(f"\n=== Recall @ low FPR (strict, WAF deployment-relevant) ===")
+    scores, labels = collect_scores(model, test_loader, device, use_bf16)
+    strict = {}
+    for fpr_target in (0.01, 0.001, 0.0001):
+        print(f"\n  Target FPR = {fpr_target}:")
+        strict[f"fpr_{fpr_target}"] = {}
+        for view in ("main", "S", "L", "A"):
+            r = recall_at_fpr(scores[view], labels, fpr_target)
+            strict[f"fpr_{fpr_target}"][view] = r
+            recall_str = f"{r['recall']:.4f}" if r['recall'] is not None else "N/A"
+            print(f"    {view:6s} recall={recall_str}  (actual FPR={r['actual_fpr']:.5f}, "
+                  f"thr={r['threshold']:.3f}, TP={r['tp']}/{r['tp']+r['fn']}, FP={r['fp']})")
+    metrics_three["strict_metrics"] = strict
     results = {"three_view": metrics_three}
 
     if not args.skip_baselines:
