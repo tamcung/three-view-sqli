@@ -1,0 +1,33 @@
+# Tri-view, Variant B: full sequences for all 3 views, single full self-attention.
+# Concat [H_S, H_L, H_C] with view-type embeddings, run multi-layer self-attention.
+
+model_variant: bpe_char_lex_full_attn
+
+model:
+  surface_vocab_size: 50265
+  surface_max_len: 257
+  surface_pad_id: 1
+  d_surface: 384
+  char_vocab_size: 257
+  char_embed_dim: 64
+  char_kernel_sizes: [3, 5, 7]
+  char_num_filters: 128
+  lex_vocab_size: 24
+  lex_max_len: 129
+  d_fusion: 256
+  n_heads: 4
+  n_layers: 4
+  fusion_layers: 4
+  hidden_dim: 64
+  dropout: 0.1
+
+epochs: 5
+batch_size: 16          # smaller bs because of joint sequence length ~600-900
+lr: 2.0e-4
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.1
+amp: fp16
+
+num_workers: 2
+log_every_steps: 100

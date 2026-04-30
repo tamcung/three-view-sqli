@@ -963,7 +963,440 @@ class BPECharLexStageModel(nn.Module):
 
 
 # ============================================================
-# 2. Child-Sum Tree-LSTM on parsed AST
+# 2. Full-sequence variants of BPECharLexStageModel
+#
+# Two variants explored to study whether using full per-position
+# sequences for ALL three views (instead of pooled vectors for Char/Lex)
+# improves fusion quality:
+#
+#   - BPECharLexFullStageModel : keep the two-stage hierarchy but feed
+#     full sequences from all three views; Stage 1 self-attends over the
+#     concatenated abstract full sequences (Lex + Char), Stage 2 cross-
+#     attends from Stage 1 output to the BPE full sequence.
+#   - BPECharLexFullAttnModel : single multi-layer self-attention over
+#     the concatenation of all three full sequences with view-type
+#     embeddings, no staging.
+#
+# Both expose the same forward() signature and accept
+# `surface_inputs_embeds` for FreeLB-style adversarial training.
+# ============================================================
+
+
+def _char_cnn_full_seq(char_embed_layer, char_convs, char_ids):
+    """CharCNN that returns the full per-position feature sequence
+    [B, T, F*n] (no max-pool over time)."""
+    x = char_embed_layer(char_ids)               # [B, T, D]
+    x = x.transpose(1, 2)                        # [B, D, T]
+    per_kernel = [F.relu(conv(x)) for conv in char_convs]
+    H = torch.cat(per_kernel, dim=1)             # [B, F*n, T]
+    return H.transpose(1, 2)                     # [B, T, F*n]
+
+
+class BPECharLexFullStageModel(nn.Module):
+    """Variant A: full-sequence Stage 1 + full-sequence Stage 2.
+
+    Stage 1: self-attention over the concatenation of full Lex sequence
+    H_L and full Char sequence H_C (each tagged with a view-type
+    embedding). Output: refined abstract sequence of length T_L + T_C.
+
+    Stage 2: cross-attention from refined abstract sequence (Q) to the
+    BPE full sequence H_S (K, V), tagged with view-type embedding.
+    """
+
+    def __init__(
+        self,
+        surface_vocab_size: int = 50265,
+        surface_max_len: int = 257,
+        surface_pad_id: int = 1,
+        d_surface: int = 384,
+        char_vocab_size: int = 257,
+        char_embed_dim: int = 64,
+        char_kernel_sizes: tuple = (3, 5, 7),
+        char_num_filters: int = 128,
+        lex_vocab_size: int = 24,
+        lex_max_len: int = 129,
+        d_fusion: int = 256,
+        n_heads: int = 4,
+        n_layers: int = 4,
+        s1_layers: int = 2,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        **_ignored,
+    ):
+        super().__init__()
+        if isinstance(char_kernel_sizes, list):
+            char_kernel_sizes = tuple(char_kernel_sizes)
+
+        try:
+            from .model import TransformerViewEncoder
+        except ImportError:
+            from model import TransformerViewEncoder
+
+        # ----- Encoders -----
+        self.surface_enc = TransformerViewEncoder(
+            vocab_size=surface_vocab_size, max_len=surface_max_len,
+            d_model=d_surface, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_surface * 4, dropout=dropout, pad_id=surface_pad_id,
+        )
+        self.surface_proj = nn.Linear(d_surface, d_fusion)
+
+        self.char_embed = nn.Embedding(char_vocab_size, char_embed_dim, padding_idx=0)
+        self.char_convs = nn.ModuleList([
+            nn.Conv1d(char_embed_dim, char_num_filters,
+                       kernel_size=k, padding=k // 2)
+            for k in char_kernel_sizes
+        ])
+        char_feat_dim = char_num_filters * len(char_kernel_sizes)
+        self.char_proj = nn.Linear(char_feat_dim, d_fusion)
+
+        self.lex_enc = TransformerViewEncoder(
+            vocab_size=lex_vocab_size, max_len=lex_max_len,
+            d_model=d_fusion, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_fusion * 4, dropout=dropout, pad_id=0,
+        )
+
+        # ----- View-type embedding (3 views: 0=BPE, 1=Lex, 2=Char) -----
+        self.view_emb = nn.Embedding(3, d_fusion)
+
+        # ----- Stage 1: self-attention over concatenated abstract sequences -----
+        s1_layer = nn.TransformerEncoderLayer(
+            d_model=d_fusion, nhead=n_heads,
+            dim_feedforward=d_fusion * 4,
+            dropout=dropout, activation="gelu",
+            batch_first=True, norm_first=True,
+        )
+        self.s1_encoder = nn.TransformerEncoder(s1_layer, num_layers=s1_layers)
+
+        # ----- Stage 2: cross-attention to BPE full sequence -----
+        self.s2_norm_q = nn.LayerNorm(d_fusion)
+        self.s2_norm_kv = nn.LayerNorm(d_fusion)
+        self.s2_cross_attn = nn.MultiheadAttention(
+            embed_dim=d_fusion, num_heads=n_heads,
+            dropout=dropout, batch_first=True,
+        )
+        self.s2_norm_ffn = nn.LayerNorm(d_fusion)
+        self.s2_ffn = nn.Sequential(
+            nn.Linear(d_fusion, d_fusion * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_fusion * 4, d_fusion),
+        )
+
+        # ----- Aux heads -----
+        self.aux_S = nn.Linear(d_surface, 1)
+        self.aux_L = nn.Linear(d_fusion, 1)
+        self.aux_C = nn.Linear(char_feat_dim, 1)
+
+        # ----- Classifier: concat([z_LA_pool, z_final_pool]) -----
+        self.classifier = nn.Sequential(
+            nn.Linear(d_fusion * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    @staticmethod
+    def _masked_mean(seq, mask):
+        """Mean-pool [B, T, d] respecting [B, T] mask (1=valid)."""
+        m = mask.unsqueeze(-1).float()
+        s = (seq * m).sum(dim=1)
+        n = m.sum(dim=1).clamp(min=1)
+        return s / n
+
+    def forward(self, surface_ids=None, surface_mask=None,
+                lex_ids=None, lex_mask=None,
+                char_ids=None, char_mask=None,
+                ast_ids=None, ast_mask=None, ast_valid=None,
+                view_dropout_prob: float = 0.0,
+                surface_inputs_embeds=None):
+        # ---- Encode each view to full sequences ----
+        if surface_inputs_embeds is not None:
+            s_out = self.surface_enc(
+                input_ids=None, attention_mask=surface_mask,
+                inputs_embeds=surface_inputs_embeds,
+            )
+        else:
+            s_out = self.surface_enc(surface_ids, surface_mask)
+        z_S = s_out["pooled"]
+        H_S = self.surface_proj(s_out["full"])               # [B, T_S, d]
+
+        H_C_raw = _char_cnn_full_seq(self.char_embed, self.char_convs, char_ids)
+        H_C = self.char_proj(H_C_raw)                         # [B, T_C, d]
+        z_C_raw = H_C_raw.max(dim=1).values                   # [B, F*n] for aux head
+
+        l_out = self.lex_enc(lex_ids, lex_mask)
+        z_L = l_out["pooled"]                                 # [B, d]
+        H_L = l_out["full"]                                   # [B, T_L, d]
+
+        # ---- Aux predictions ----
+        p_S = self.aux_S(z_S).squeeze(-1)
+        p_L = self.aux_L(z_L).squeeze(-1)
+        p_A = self.aux_C(z_C_raw).squeeze(-1)
+
+        # ---- View-type tagging ----
+        B = H_S.size(0)
+        dev = H_S.device
+        v_S = self.view_emb(torch.tensor(0, device=dev))      # [d]
+        v_L = self.view_emb(torch.tensor(1, device=dev))
+        v_C = self.view_emb(torch.tensor(2, device=dev))
+        H_S_t = H_S + v_S
+        H_L_t = H_L + v_L
+        H_C_t = H_C + v_C
+
+        # ---- View dropout (zero whole view's contribution if dropped) ----
+        if self.training and view_dropout_prob > 0:
+            keep_S = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            keep_L = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            keep_C = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            H_S_t = H_S_t * keep_S
+            H_L_t = H_L_t * keep_L
+            H_C_t = H_C_t * keep_C
+
+        # ---- Stage 1: self-attention over abstract full sequences ----
+        abstract = torch.cat([H_L_t, H_C_t], dim=1)           # [B, T_L+T_C, d]
+        # Pad mask: 1=valid, 0=pad. Cat along time.
+        if char_mask is None:
+            char_mask = (char_ids != 0).long()
+        if lex_mask is None:
+            lex_mask = (lex_ids != 0).long()
+        abstract_mask = torch.cat([lex_mask, char_mask], dim=1)
+        abstract_pad = ~abstract_mask.bool()
+        attended_abstract = self.s1_encoder(
+            abstract, src_key_padding_mask=abstract_pad,
+        )
+
+        # ---- Stage 2: cross-attention Q=abstract, K/V=BPE ----
+        q = self.s2_norm_q(attended_abstract)
+        kv = self.s2_norm_kv(H_S_t)
+        kv_pad = ~surface_mask.bool() if surface_mask is not None else None
+        attn_out, _ = self.s2_cross_attn(
+            query=q, key=kv, value=kv,
+            key_padding_mask=kv_pad, need_weights=False,
+        )
+        attended_full = attended_abstract + attn_out
+        ffn = self.s2_ffn(self.s2_norm_ffn(attended_full))
+        attended_full = attended_full + ffn                   # [B, T_L+T_C, d]
+
+        # ---- Pool both stages, concat ----
+        z_LA = self._masked_mean(attended_abstract, abstract_mask)   # post-Stage1
+        z_final = self._masked_mean(attended_full, abstract_mask)    # post-Stage2
+
+        cls_input = torch.cat([z_LA, z_final], dim=-1)
+        p_main = self.classifier(cls_input).squeeze(-1)
+
+        return {
+            "p_main": p_main,
+            "p_S": p_S, "p_L": p_L, "p_A": p_A,
+            "z_S": z_S, "z_L": z_L, "z_A": z_C_raw,
+            "z_LA": z_LA, "z_final": z_final,
+        }
+
+    def compute_loss(self, output, labels,
+                       weights=(0.7, 0.1, 0.1, 0.1), pos_weight=None):
+        labels = labels.float()
+        w_main, w_S, w_L, w_C = weights
+        def bce(logits):
+            return F.binary_cross_entropy_with_logits(
+                logits, labels, pos_weight=pos_weight)
+        loss_main = bce(output["p_main"])
+        loss_S = bce(output["p_S"])
+        loss_L = bce(output["p_L"])
+        loss_C = bce(output["p_A"])
+        total = (w_main * loss_main + w_S * loss_S
+                  + w_L * loss_L + w_C * loss_C)
+        return total, {
+            "loss_total": total.item(),
+            "loss_main": loss_main.item(),
+            "loss_S": loss_S.item(),
+            "loss_L": loss_L.item(),
+            "loss_A": loss_C.item(),
+        }
+
+
+class BPECharLexFullAttnModel(nn.Module):
+    """Variant B: single multi-layer self-attention over concatenated
+    full sequences from all three views, no staging."""
+
+    def __init__(
+        self,
+        surface_vocab_size: int = 50265,
+        surface_max_len: int = 257,
+        surface_pad_id: int = 1,
+        d_surface: int = 384,
+        char_vocab_size: int = 257,
+        char_embed_dim: int = 64,
+        char_kernel_sizes: tuple = (3, 5, 7),
+        char_num_filters: int = 128,
+        lex_vocab_size: int = 24,
+        lex_max_len: int = 129,
+        d_fusion: int = 256,
+        n_heads: int = 4,
+        n_layers: int = 4,
+        fusion_layers: int = 4,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        **_ignored,
+    ):
+        super().__init__()
+        if isinstance(char_kernel_sizes, list):
+            char_kernel_sizes = tuple(char_kernel_sizes)
+
+        try:
+            from .model import TransformerViewEncoder
+        except ImportError:
+            from model import TransformerViewEncoder
+
+        # Encoders
+        self.surface_enc = TransformerViewEncoder(
+            vocab_size=surface_vocab_size, max_len=surface_max_len,
+            d_model=d_surface, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_surface * 4, dropout=dropout, pad_id=surface_pad_id,
+        )
+        self.surface_proj = nn.Linear(d_surface, d_fusion)
+
+        self.char_embed = nn.Embedding(char_vocab_size, char_embed_dim, padding_idx=0)
+        self.char_convs = nn.ModuleList([
+            nn.Conv1d(char_embed_dim, char_num_filters,
+                       kernel_size=k, padding=k // 2)
+            for k in char_kernel_sizes
+        ])
+        char_feat_dim = char_num_filters * len(char_kernel_sizes)
+        self.char_proj = nn.Linear(char_feat_dim, d_fusion)
+
+        self.lex_enc = TransformerViewEncoder(
+            vocab_size=lex_vocab_size, max_len=lex_max_len,
+            d_model=d_fusion, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_fusion * 4, dropout=dropout, pad_id=0,
+        )
+
+        # View-type embedding
+        self.view_emb = nn.Embedding(3, d_fusion)
+
+        # Single full self-attention over concatenated three views
+        fusion_layer = nn.TransformerEncoderLayer(
+            d_model=d_fusion, nhead=n_heads,
+            dim_feedforward=d_fusion * 4,
+            dropout=dropout, activation="gelu",
+            batch_first=True, norm_first=True,
+        )
+        self.fusion_encoder = nn.TransformerEncoder(fusion_layer, num_layers=fusion_layers)
+
+        # Aux heads
+        self.aux_S = nn.Linear(d_surface, 1)
+        self.aux_L = nn.Linear(d_fusion, 1)
+        self.aux_C = nn.Linear(char_feat_dim, 1)
+
+        # Classifier from masked mean of fused sequence
+        self.classifier = nn.Sequential(
+            nn.Linear(d_fusion, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    @staticmethod
+    def _masked_mean(seq, mask):
+        m = mask.unsqueeze(-1).float()
+        s = (seq * m).sum(dim=1)
+        n = m.sum(dim=1).clamp(min=1)
+        return s / n
+
+    def forward(self, surface_ids=None, surface_mask=None,
+                lex_ids=None, lex_mask=None,
+                char_ids=None, char_mask=None,
+                ast_ids=None, ast_mask=None, ast_valid=None,
+                view_dropout_prob: float = 0.0,
+                surface_inputs_embeds=None):
+        # ---- Encode each view to full sequences ----
+        if surface_inputs_embeds is not None:
+            s_out = self.surface_enc(
+                input_ids=None, attention_mask=surface_mask,
+                inputs_embeds=surface_inputs_embeds,
+            )
+        else:
+            s_out = self.surface_enc(surface_ids, surface_mask)
+        z_S = s_out["pooled"]
+        H_S = self.surface_proj(s_out["full"])               # [B, T_S, d]
+
+        H_C_raw = _char_cnn_full_seq(self.char_embed, self.char_convs, char_ids)
+        H_C = self.char_proj(H_C_raw)                        # [B, T_C, d]
+        z_C_raw = H_C_raw.max(dim=1).values
+
+        l_out = self.lex_enc(lex_ids, lex_mask)
+        z_L = l_out["pooled"]
+        H_L = l_out["full"]                                  # [B, T_L, d]
+
+        # Aux
+        p_S = self.aux_S(z_S).squeeze(-1)
+        p_L = self.aux_L(z_L).squeeze(-1)
+        p_A = self.aux_C(z_C_raw).squeeze(-1)
+
+        # View tag + concat
+        B = H_S.size(0); dev = H_S.device
+        v_S = self.view_emb(torch.tensor(0, device=dev))
+        v_L = self.view_emb(torch.tensor(1, device=dev))
+        v_C = self.view_emb(torch.tensor(2, device=dev))
+        H_S_t = H_S + v_S
+        H_L_t = H_L + v_L
+        H_C_t = H_C + v_C
+
+        # View dropout
+        if self.training and view_dropout_prob > 0:
+            keep_S = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            keep_L = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            keep_C = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            H_S_t = H_S_t * keep_S
+            H_L_t = H_L_t * keep_L
+            H_C_t = H_C_t * keep_C
+
+        if char_mask is None:
+            char_mask = (char_ids != 0).long()
+        if lex_mask is None:
+            lex_mask = (lex_ids != 0).long()
+
+        # Concatenate and compute joint mask
+        fused = torch.cat([H_S_t, H_L_t, H_C_t], dim=1)      # [B, T_S+T_L+T_C, d]
+        joint_mask = torch.cat([surface_mask, lex_mask, char_mask], dim=1)
+        joint_pad = ~joint_mask.bool()
+
+        # Single full self-attention
+        out = self.fusion_encoder(fused, src_key_padding_mask=joint_pad)
+
+        # Pool & classify
+        z_final = self._masked_mean(out, joint_mask)         # [B, d]
+        p_main = self.classifier(z_final).squeeze(-1)
+
+        return {
+            "p_main": p_main,
+            "p_S": p_S, "p_L": p_L, "p_A": p_A,
+            "z_S": z_S, "z_L": z_L, "z_A": z_C_raw,
+            "z_LA": z_final, "z_final": z_final,
+        }
+
+    def compute_loss(self, output, labels,
+                       weights=(0.7, 0.1, 0.1, 0.1), pos_weight=None):
+        labels = labels.float()
+        w_main, w_S, w_L, w_C = weights
+        def bce(logits):
+            return F.binary_cross_entropy_with_logits(
+                logits, labels, pos_weight=pos_weight)
+        loss_main = bce(output["p_main"])
+        loss_S = bce(output["p_S"])
+        loss_L = bce(output["p_L"])
+        loss_C = bce(output["p_A"])
+        total = (w_main * loss_main + w_S * loss_S
+                  + w_L * loss_L + w_C * loss_C)
+        return total, {
+            "loss_total": total.item(),
+            "loss_main": loss_main.item(),
+            "loss_S": loss_S.item(),
+            "loss_L": loss_L.item(),
+            "loss_A": loss_C.item(),
+        }
+
+
+# ============================================================
+# 3. Child-Sum Tree-LSTM on parsed AST
 # ============================================================
 class TreeLSTMCell(nn.Module):
     """Child-Sum Tree-LSTM cell (Tai et al. 2015).

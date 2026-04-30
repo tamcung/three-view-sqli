@@ -282,4 +282,16 @@ def build_model(variant: str, model_kwargs: dict) -> nn.Module:
         except ImportError:
             from baseline_models import BPECharLexStageModel
         return BPECharLexStageModel(**model_kwargs)
+    if variant in ("bpe_char_lex_full_stage", "tri_view_full_stage"):
+        try:
+            from .baseline_models import BPECharLexFullStageModel
+        except ImportError:
+            from baseline_models import BPECharLexFullStageModel
+        return BPECharLexFullStageModel(**model_kwargs)
+    if variant in ("bpe_char_lex_full_attn", "tri_view_full_attn"):
+        try:
+            from .baseline_models import BPECharLexFullAttnModel
+        except ImportError:
+            from baseline_models import BPECharLexFullAttnModel
+        return BPECharLexFullAttnModel(**model_kwargs)
     raise ValueError(f"Unknown model_variant: {variant}")
