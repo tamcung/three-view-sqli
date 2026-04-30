@@ -1,0 +1,28 @@
+# Char-level CNN baseline.
+# Each utf-8 byte of user_input → id ∈ [1,256]; embedding → parallel
+# Conv1d (kernel 3/5/7) → ReLU → global max-pool → concat → FC.
+#
+# Designed to test whether character-level n-gram features (analogous to
+# TF-IDF char_wb 3-5) are sufficient for SQLi detection at user_input
+# granularity.
+
+model_variant: char_cnn
+
+model:
+  char_vocab_size: 257       # 256 byte values + PAD(0)
+  embed_dim: 64
+  kernel_sizes: [3, 5, 7]
+  num_filters: 128
+  hidden_dim: 64
+  dropout: 0.5
+
+epochs: 5
+batch_size: 64
+lr: 1.0e-3
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.0
+amp: fp32                    # GTX 1070 Ti has no BF16; keep fp32 (model is small)
+
+num_workers: 0
+log_every_steps: 50

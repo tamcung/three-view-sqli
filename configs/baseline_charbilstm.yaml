@@ -1,0 +1,22 @@
+# Char-level BiLSTM baseline (counterpart to CharCNN).
+# Each utf-8 byte → embedding → BiLSTM → MLP head.
+
+model_variant: char_bilstm
+
+model:
+  char_vocab_size: 257
+  embed_dim: 64
+  hidden_dim: 128
+  num_layers: 1
+  dropout: 0.1
+
+epochs: 5
+batch_size: 64
+lr: 1.0e-3
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.0
+amp: fp32
+
+num_workers: 0
+log_every_steps: 50

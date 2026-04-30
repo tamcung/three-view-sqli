@@ -1,0 +1,36 @@
+# Main config: full three-view fusion model on the full dataset.
+#
+# Run:
+#   python train.py --config configs/main.yaml --output results/main/
+#   python evaluate.py --checkpoint results/main/best_checkpoint.pt --output results/main/eval/
+
+model_variant: three_view
+
+model:
+  surface_vocab_size: 50265
+  surface_max_len: 513
+  surface_pad_id: 1
+  lex_vocab_size: 24
+  lex_max_len: 129
+  ast_vocab_size: 100
+  ast_max_len: 257
+  d_surface: 384
+  d_abstract: 256
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+
+# Training
+epochs: 5
+batch_size: 64
+lr: 2.0e-4
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.1            # per-view dropout during training
+amp: bf16                    # 'bf16' (default — needs Ampere+) or 'fp16'
+
+# Data
+num_workers: 2
+
+# Logging
+log_every_steps: 50

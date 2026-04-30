@@ -1,0 +1,23 @@
+# Tree-LSTM baseline (Hu Xiuwen 2024 paper, "AST-LSTM" / "Tree-LSTM" row).
+# Single-view: parsed AST as tree → Child-Sum Tree-LSTM → MLP head.
+# Hu's setup: embed=64, hidden=128.
+
+model_variant: tree_lstm
+
+model:
+  ast_vocab_size: 100
+  ast_pad_id: 0
+  embed_dim: 64
+  hidden_dim: 128
+  dropout: 0.1
+
+epochs: 5
+batch_size: 32       # Tree-LSTM forward is slow per-sample, smaller batch helps GPU util
+lr: 1.0e-3
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.0
+amp: bf16
+
+num_workers: 0       # Tree-LSTM uses Python loops; multiprocessing collate not helpful
+log_every_steps: 50

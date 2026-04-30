@@ -1,0 +1,32 @@
+# Two-view: CharCNN (surface, sequence) + Lex Transformer + cross-attention.
+# Lex CLS as query, char per-position features as KV.
+# No de-obfuscation pre-processing.
+
+model_variant: char_lex_xattn
+
+model:
+  # Char surface
+  char_vocab_size: 257
+  char_embed_dim: 64
+  char_kernel_sizes: [3, 5, 7]
+  char_num_filters: 128
+  # Lex Transformer
+  lex_vocab_size: 24
+  lex_max_len: 129
+  n_layers_lex: 4
+  # Fusion
+  d_fusion: 256
+  n_heads: 4
+  hidden_dim: 128
+  dropout: 0.1
+
+epochs: 5
+batch_size: 64
+lr: 5.0e-4
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.1
+amp: fp16
+
+num_workers: 2
+log_every_steps: 50

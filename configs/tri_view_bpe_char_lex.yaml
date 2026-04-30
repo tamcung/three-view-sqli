@@ -1,0 +1,37 @@
+# Three-view: BPE Transformer (sub-word surface) + CharCNN (byte surface)
+# + Lex Transformer (libinjection abstract). Lex CLS does dual cross-attn
+# over both surface sequences. No de-obfuscation.
+
+model_variant: bpe_char_lex
+
+model:
+  # BPE surface
+  surface_vocab_size: 50265
+  surface_max_len: 257
+  surface_pad_id: 1
+  d_surface: 384
+  # CharCNN surface
+  char_vocab_size: 257
+  char_embed_dim: 64
+  char_kernel_sizes: [3, 5, 7]
+  char_num_filters: 128
+  # Lex abstract
+  lex_vocab_size: 24
+  lex_max_len: 129
+  # Fusion
+  d_fusion: 256
+  n_heads: 4
+  n_layers: 4
+  hidden_dim: 128
+  dropout: 0.1
+
+epochs: 5
+batch_size: 32                # smaller batch for 8GB VRAM (BPE Transformer dominates)
+lr: 2.0e-4
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.1
+amp: fp16
+
+num_workers: 2
+log_every_steps: 50

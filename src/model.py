@@ -66,11 +66,31 @@ class TransformerViewEncoder(nn.Module):
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
         self.final_norm = nn.LayerNorm(d_model)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> dict:
-        """Returns dict with 'pooled' [B, d] (CLS) and 'full' [B, T, d]."""
-        B, T = input_ids.shape
-        pos = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
-        x = self.token_emb(input_ids) + self.pos_emb(pos)
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> dict:
+        """Returns dict with 'pooled' [B, d] (CLS) and 'full' [B, T, d].
+
+        Either ``input_ids`` (shape [B, T]) or ``inputs_embeds`` (shape
+        [B, T, d_model]) must be provided. When ``inputs_embeds`` is
+        passed, the token-embedding lookup is skipped — this lets
+        FreeLB-style adversarial training inject a perturbed embedding
+        tensor.
+        """
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Provide exactly one of input_ids / inputs_embeds")
+
+        if inputs_embeds is None:
+            B, T = input_ids.shape
+            pos = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
+            x = self.token_emb(input_ids) + self.pos_emb(pos)
+        else:
+            B, T, _ = inputs_embeds.shape
+            pos = torch.arange(T, device=inputs_embeds.device).unsqueeze(0).expand(B, -1)
+            x = inputs_embeds + self.pos_emb(pos)
         x = self.emb_norm(x)
         x = self.emb_dropout(x)
 
@@ -305,14 +325,22 @@ class ThreeViewModel(nn.Module):
         output: dict,
         labels: torch.Tensor,
         weights: tuple[float, float, float, float] = (0.7, 0.1, 0.1, 0.1),
+        pos_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
-        """Returns (total_loss, loss_components_dict)."""
+        """Returns (total_loss, loss_components_dict).
+
+        pos_weight: optional scalar tensor passed to BCE for class imbalance.
+        Set to (n_neg / n_pos) when negatives are over-represented; <1.0 when
+        positives dominate.
+        """
         labels = labels.float()
         w_main, w_S, w_L, w_A = weights
-        loss_main = F.binary_cross_entropy_with_logits(output["p_main"], labels)
-        loss_S = F.binary_cross_entropy_with_logits(output["p_S"], labels)
-        loss_L = F.binary_cross_entropy_with_logits(output["p_L"], labels)
-        loss_A = F.binary_cross_entropy_with_logits(output["p_A"], labels)
+        bce = lambda logits: F.binary_cross_entropy_with_logits(
+            logits, labels, pos_weight=pos_weight)
+        loss_main = bce(output["p_main"])
+        loss_S = bce(output["p_S"])
+        loss_L = bce(output["p_L"])
+        loss_A = bce(output["p_A"])
         total = w_main * loss_main + w_S * loss_S + w_L * loss_L + w_A * loss_A
         return total, {
             "loss_total": total.item(),

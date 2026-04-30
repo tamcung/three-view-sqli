@@ -1,222 +1,322 @@
 #!/usr/bin/env python3
-"""
-Standalone evaluation: load a checkpoint, evaluate on test set, run baselines.
+"""Standalone evaluation: load a trained checkpoint, run on test split, then
+compare to two baselines (libinjection-only and TF-IDF + Logistic Regression).
+
+Reports global metrics + per-stratum breakdowns:
+  - per attack technique  (recall = TPR for that technique)
+  - per victim_slot_context  (precision/recall/F1 within that subset)
+  - per benign_subtype  (FPR for probe / plain / numeric / identifier)
+  - per source_project
+  - per statement_type
 
 Usage:
-    python evaluate.py --checkpoint results/run_001/best_checkpoint.pt --output results/run_001/eval/
-
-Reports:
-    - main + 3 single-view F1/P/R/Acc + Wilson CI
-    - libinjection (rule-based) baseline F1/P/R/Acc + Wilson CI on the same test set
-    - TF-IDF + LR baseline (trained on train split)
+  python evaluate.py --checkpoint results/run_001/best_checkpoint.pt \
+                     --output  results/run_001/eval/
 """
 from __future__ import annotations
 import argparse
 import json
-import math
+import logging
 import sys
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 import yaml
+from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
-from src.preprocessing import SamplePreprocessor
-from src.dataset import (
-    build_split_files, preprocess_split_file,
-    WafamoleThreeViewDataset, collate_three_view,
-)
-from src.model import ThreeViewModel
-from src.libinjection_wrapper import is_sqli as libinj_is_sqli
-
-from train import wilson_ci, binary_metrics, evaluate as model_evaluate
+from preprocessing import SamplePreprocessor
+from dataset import SQLDataset, collate_three_view, move_batch_to
+from model import ThreeViewModel
+from ablation_models import build_model
+from libinjection_wrapper import is_sqli as libinj_is_sqli
 
 
 # ============================================================
-# Strict metric: recall at a fixed false-positive rate
+# Generic metrics
 # ============================================================
-def recall_at_fpr(scores: np.ndarray, labels: np.ndarray, target_fpr: float) -> dict:
-    """Find the threshold that yields ≤ target_fpr on negatives, then report
-    recall on positives at that threshold.
-
-    For WAFs: business cost of false positives is high, so the operationally
-    meaningful question is "if I allow at most X% benign false alarms, how many
-    attacks do I catch?"
-    """
-    # Negative scores → find threshold
-    neg = scores[labels == 0]
-    pos = scores[labels == 1]
-    if len(neg) == 0 or len(pos) == 0:
-        return {"target_fpr": target_fpr, "actual_fpr": None,
-                "recall": None, "threshold": None}
-    # Threshold = the (1 - target_fpr) quantile of negative scores
-    # Anything above this threshold is predicted positive (FP for negatives)
-    k = max(1, int(len(neg) * target_fpr))
-    threshold = float(np.partition(neg, -k)[-k])
-    fp = int((neg > threshold).sum())
-    tp = int((pos > threshold).sum())
-    actual_fpr = fp / len(neg)
-    recall = tp / len(pos)
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray | None = None) -> dict:
+    from sklearn.metrics import (
+        precision_recall_fscore_support, accuracy_score, roc_auc_score,
+        confusion_matrix,
+    )
+    P, R, F1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", zero_division=0,
+    )
+    acc = accuracy_score(y_true, y_pred)
+    auc = float("nan")
+    if y_prob is not None and len(set(y_true)) > 1:
+        try:
+            auc = roc_auc_score(y_true, y_prob)
+        except ValueError:
+            pass
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
     return {
-        "target_fpr": target_fpr,
-        "actual_fpr": actual_fpr,
-        "threshold": threshold,
-        "recall": recall,
-        "tp": tp, "fn": int(len(pos) - tp),
-        "fp": fp, "tn": int(len(neg) - fp),
+        "n": int(len(y_true)),
+        "n_pos": int(int((y_true == 1).sum())),
+        "n_neg": int(int((y_true == 0).sum())),
+        "precision": float(P),
+        "recall": float(R),
+        "f1": float(F1),
+        "accuracy": float(acc),
+        "auc": float(auc),
+        "tp": int(tp), "fn": int(fn), "fp": int(fp), "tn": int(tn),
     }
 
 
+def stratified_breakdown(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: np.ndarray | None,
+    strata: list,
+) -> dict:
+    """For each unique value in `strata`, compute metrics on that subset."""
+    breakdown = {}
+    strata_arr = np.array(strata, dtype=object)
+    uniq = sorted({s for s in strata if s is not None}, key=lambda s: str(s))
+    for v in uniq:
+        idx = np.where(strata_arr == v)[0]
+        if len(idx) == 0:
+            continue
+        sub_true = y_true[idx]
+        sub_pred = y_pred[idx]
+        sub_prob = y_prob[idx] if y_prob is not None else None
+        breakdown[str(v)] = compute_metrics(sub_true, sub_pred, sub_prob)
+    return breakdown
+
+
+# ============================================================
+# Three-view inference
+# ============================================================
 @torch.no_grad()
-def collect_scores(model, loader, device, use_bf16: bool):
-    """Run model and return raw logits per view + labels (for strict metrics)."""
+def model_predict(model, loader, device):
+    import inspect
     model.eval()
-    sc = {k: [] for k in ("main", "S", "L", "A")}
-    labels_all = []
-    autocast_kw = {"dtype": torch.bfloat16, "enabled": use_bf16}
+    logits_all, labels_all, meta_all = [], [], []
+    amp_enabled = device.type == "cuda"
+    accepted = set(inspect.signature(model.forward).parameters.keys())
     for batch in loader:
-        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-        with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu", **autocast_kw):
-            out = model(
-                batch["surface_ids"], batch["surface_mask"],
-                batch["lex_ids"], batch["lex_mask"],
-                batch["ast_ids"], batch["ast_mask"],
-                batch["ast_valid"],
-                view_dropout_prob=0.0,
-            )
-        sc["main"].append(out["p_main"].float().cpu().numpy())
-        sc["S"].append(out["p_S"].float().cpu().numpy())
-        sc["L"].append(out["p_L"].float().cpu().numpy())
-        sc["A"].append(out["p_A"].float().cpu().numpy())
-        labels_all.append(batch["label"].cpu().numpy())
-    return ({k: np.concatenate(v) for k, v in sc.items()},
-            np.concatenate(labels_all))
+        batch = move_batch_to(batch, device)
+        kwargs = dict(
+            surface_ids=batch["surface_ids"],
+            surface_mask=batch["surface_mask"],
+            lex_ids=batch["lex_ids"],
+            lex_mask=batch["lex_mask"],
+            ast_ids=batch["ast_ids"],
+            ast_mask=batch["ast_mask"],
+            ast_valid=batch["ast_valid"],
+            view_dropout_prob=0.0,
+            ast_node_ids=batch.get("ast_node_ids"),
+            ast_parent=batch.get("ast_parent"),
+            char_ids=batch.get("char_ids"),
+            char_mask=batch.get("char_mask"),
+        )
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+            out = model(**{k: v for k, v in kwargs.items() if k in accepted})
+        logits_all.append(out["p_main"].float().cpu().numpy())
+        labels_all.append(batch["labels"].cpu().numpy())
+        meta_all.extend(batch["meta"])
+    return (
+        np.concatenate(logits_all),
+        np.concatenate(labels_all),
+        meta_all,
+    )
 
 
-def evaluate_libinjection(test_jsonl: Path) -> dict:
-    """Run libinjection on every test sample, compute metrics."""
-    import json as _json
+# ============================================================
+# Baseline 1: libinjection-only
+# ============================================================
+def baseline_libinjection(jsonl_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """libinjection.is_sqli on raw user_input — returns (preds, labels)."""
     preds, labels = [], []
-    with open(test_jsonl, encoding="utf-8") as f:
+    with open(jsonl_path, encoding="utf-8") as f:
         for line in f:
-            obj = _json.loads(line)
-            flag, _ = libinj_is_sqli(obj["text"])
-            preds.append(int(flag))
-            labels.append(obj["label"])
-    return binary_metrics(np.array(preds, dtype=float) - 0.5, np.array(labels))
+            r = json.loads(line)
+            res = libinj_is_sqli(r["user_input"])
+            preds.append(1 if (res[0] if isinstance(res, tuple) else res) else 0)
+            labels.append(1 if r["label"] == "attack" else 0)
+    return np.array(preds), np.array(labels)
 
 
-def evaluate_tfidf_lr(train_jsonl: Path, test_jsonl: Path) -> dict:
-    """Train TF-IDF + LR on train split, evaluate on test."""
+# ============================================================
+# Baseline 2: TF-IDF + Logistic Regression on surface text
+# ============================================================
+def baseline_tfidf_lr(train_jsonl: Path, test_jsonl: Path):
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.linear_model import LogisticRegression
-    import json as _json
 
-    print("  loading train texts...", flush=True)
-    X_train, y_train = [], []
-    with open(train_jsonl, encoding="utf-8") as f:
-        for line in f:
-            obj = _json.loads(line)
-            X_train.append(obj["text"])
-            y_train.append(obj["label"])
-    X_test, y_test = [], []
-    with open(test_jsonl, encoding="utf-8") as f:
-        for line in f:
-            obj = _json.loads(line)
-            X_test.append(obj["text"])
-            y_test.append(obj["label"])
+    def load(path):
+        with open(path, encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f]
+        sqls = [r["user_input"] for r in rows]
+        ys = np.array([1 if r["label"] == "attack" else 0 for r in rows])
+        return sqls, ys
 
-    print(f"  fitting TF-IDF on {len(X_train)} samples...", flush=True)
-    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5),
-                           max_features=100000, lowercase=True, sublinear_tf=True)
-    Xtr = vec.fit_transform(X_train)
-    Xte = vec.transform(X_test)
-    print(f"  training LR...", flush=True)
-    clf = LogisticRegression(max_iter=200, solver="liblinear")
-    clf.fit(Xtr, np.array(y_train))
-    scores = clf.decision_function(Xte)
-    return binary_metrics(scores, np.array(y_test))
+    train_sqls, train_y = load(train_jsonl)
+    test_sqls, test_y = load(test_jsonl)
+
+    vec = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(3, 5),
+        max_features=50_000, sublinear_tf=True,
+    )
+    Xtr = vec.fit_transform(train_sqls)
+    Xte = vec.transform(test_sqls)
+    clf = LogisticRegression(
+        max_iter=300, C=1.0, solver="liblinear",
+        class_weight="balanced",
+    )
+    clf.fit(Xtr, train_y)
+
+    probs = clf.predict_proba(Xte)[:, 1]
+    preds = (probs >= 0.5).astype(int)
+    return preds, probs, test_y
 
 
+# ============================================================
+# Main
+# ============================================================
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", required=True, type=Path)
-    ap.add_argument("--output", required=True, type=Path)
-    ap.add_argument("--skip-baselines", action="store_true")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--output", type=str, required=True)
+    p.add_argument("--config", type=str, default=None,
+                    help="Optional config (defaults to checkpoint dir/config.yaml)")
+    p.add_argument("--baselines", action="store_true", default=True,
+                    help="Run baselines (default on)")
+    p.add_argument("--no-baselines", dest="baselines", action="store_false")
+    p.add_argument("--threshold", type=float, default=0.5)
+    args = p.parse_args()
 
-    args.output.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(out_dir / "evaluation.log", encoding="utf-8"),
+        ],
+    )
+    log = logging.getLogger("eval")
 
-    print(f"Loading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = ckpt["config"]
+    ckpt_path = Path(args.checkpoint)
+    cfg_path = Path(args.config) if args.config else ckpt_path.parent / "config.yaml"
+    cfg = yaml.safe_load(open(cfg_path, encoding="utf-8")) if cfg_path.exists() else {}
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_bf16 = bool(cfg["train"].get("use_bf16", False)) and device.type == "cuda" and torch.cuda.is_bf16_supported()
+    log.info(f"Device: {device}")
 
-    # Reload data with same split
-    pre = SamplePreprocessor()
-    split_paths = build_split_files(
-        n_train_per_class=cfg["n_train_per_class"],
-        n_val_per_class=cfg["n_val_per_class"],
-        n_test_per_class=cfg["n_test_per_class"],
-        seed=cfg["seed"],
-    )
-    cache_paths = {s: preprocess_split_file(p, pre) for s, p in split_paths.items()}
-
-    test_ds = WafamoleThreeViewDataset(cache_paths["test"])
-    test_loader = DataLoader(test_ds, batch_size=cfg["train"]["batch_size"],
-                             shuffle=False, collate_fn=collate_three_view,
-                             num_workers=cfg["train"].get("num_workers", 0),
-                             pin_memory=device.type == "cuda")
-
-    # Reload model
-    model = ThreeViewModel(**cfg["model"]).to(device)
+    # Load model
+    variant = cfg.get("model_variant", "three_view")
+    model = build_model(variant, cfg.get("model", {})).to(device)
+    ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model"])
+    log.info(f"Loaded checkpoint: {ckpt_path}  variant={variant}  "
+             f"epoch={ckpt.get('epoch')}  best_val_f1={ckpt.get('best_val_f1')}")
 
-    print(f"\n=== Three-view model evaluation on test set ({len(test_ds)} samples) ===")
-    metrics_three = model_evaluate(model, test_loader, device, use_bf16)
-    for view in ("main", "S", "L", "A"):
-        m = metrics_three[view]
-        print(f"  {view:6s} F1={m['f1']:.4f}  P={m['precision']:.4f}  R={m['recall']:.4f}  "
-              f"Acc={m['accuracy']:.4f}  CI[{m['acc_ci_low']:.4f}, {m['acc_ci_high']:.4f}]")
+    # Test set
+    pre = SamplePreprocessor()
+    test_path = ROOT / "data" / "splits" / "test.jsonl"
+    train_path = ROOT / "data" / "splits" / "train.jsonl"
+    cache_dir = ROOT / "data" / "cache"
+    test_ds = SQLDataset(test_path, cache_dir / "test.pkl", pre)
+    test_loader = DataLoader(
+        test_ds, batch_size=cfg.get("batch_size", 64) * 2, shuffle=False,
+        collate_fn=collate_three_view, num_workers=cfg.get("num_workers", 2),
+        pin_memory=True,
+    )
 
-    # Strict metrics: recall at low FPR (the operationally meaningful WAF metric)
-    print(f"\n=== Recall @ low FPR (strict, WAF deployment-relevant) ===")
-    scores, labels = collect_scores(model, test_loader, device, use_bf16)
-    strict = {}
-    for fpr_target in (0.01, 0.001, 0.0001):
-        print(f"\n  Target FPR = {fpr_target}:")
-        strict[f"fpr_{fpr_target}"] = {}
-        for view in ("main", "S", "L", "A"):
-            r = recall_at_fpr(scores[view], labels, fpr_target)
-            strict[f"fpr_{fpr_target}"][view] = r
-            recall_str = f"{r['recall']:.4f}" if r['recall'] is not None else "N/A"
-            print(f"    {view:6s} recall={recall_str}  (actual FPR={r['actual_fpr']:.5f}, "
-                  f"thr={r['threshold']:.3f}, TP={r['tp']}/{r['tp']+r['fn']}, FP={r['fp']})")
-    metrics_three["strict_metrics"] = strict
-    results = {"three_view": metrics_three}
+    # ---- Three-view inference ----
+    log.info("Running three-view model inference on test split...")
+    t0 = time.time()
+    logits, labels, metas = model_predict(model, test_loader, device)
+    log.info(f"  done in {time.time() - t0:.1f}s ({len(labels)} samples)")
 
-    if not args.skip_baselines:
-        print("\n=== libinjection baseline ===")
-        m_lib = evaluate_libinjection(split_paths["test"])
-        print(f"  F1={m_lib['f1']:.4f}  P={m_lib['precision']:.4f}  R={m_lib['recall']:.4f}  "
-              f"Acc={m_lib['accuracy']:.4f}  CI[{m_lib['acc_ci_low']:.4f}, {m_lib['acc_ci_high']:.4f}]")
-        results["libinjection"] = m_lib
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    preds = (probs >= args.threshold).astype(int)
 
-        print("\n=== TF-IDF + LR baseline ===")
-        m_tfidf = evaluate_tfidf_lr(split_paths["train"], split_paths["test"])
-        print(f"  F1={m_tfidf['f1']:.4f}  P={m_tfidf['precision']:.4f}  R={m_tfidf['recall']:.4f}  "
-              f"Acc={m_tfidf['accuracy']:.4f}  CI[{m_tfidf['acc_ci_low']:.4f}, {m_tfidf['acc_ci_high']:.4f}]")
-        results["tfidf_lr"] = m_tfidf
+    # Global metrics
+    global_metrics = compute_metrics(labels, preds, probs)
+    log.info(
+        f"Three-view global: f1={global_metrics['f1']:.4f}  "
+        f"P={global_metrics['precision']:.4f}  R={global_metrics['recall']:.4f}  "
+        f"acc={global_metrics['accuracy']:.4f}  auc={global_metrics['auc']:.4f}"
+    )
 
-    out_file = args.output / "evaluation.json"
-    out_file.write_text(json.dumps(results, indent=2))
-    print(f"\nWrote {out_file}")
+    # Stratified breakdowns
+    strata_specs = {
+        "source": [m.get("source") for m in metas],
+        "subtype": [m.get("subtype") for m in metas],
+        "technique": [m.get("technique") for m in metas],
+    }
+    breakdowns = {
+        name: stratified_breakdown(labels, preds, probs, strata)
+        for name, strata in strata_specs.items()
+    }
+
+    # Specifically log LLM hard-negative FPR (replaces probe)
+    llm_idx = np.array([m.get("source") == "llm" for m in metas])
+    if llm_idx.any():
+        n_llm = int(llm_idx.sum())
+        n_llm_fp = int((preds[llm_idx] == 1).sum())
+        log.info(
+            f"LLM hard-negative FPR: {n_llm_fp}/{n_llm} = "
+            f"{n_llm_fp / max(n_llm, 1) * 100:.2f}%  "
+            f"(LLM-generated SQL-keyword text misclassified as attack)"
+        )
+
+    # ---- Baselines ----
+    baseline_results = {}
+
+    if args.baselines:
+        log.info("\nBaseline 1: libinjection.is_sqli ...")
+        t0 = time.time()
+        lib_preds, lib_labels = baseline_libinjection(test_path)
+        lib_metrics = compute_metrics(lib_labels, lib_preds, lib_preds.astype(float))
+        log.info(
+            f"  libinjection: f1={lib_metrics['f1']:.4f}  "
+            f"P={lib_metrics['precision']:.4f}  R={lib_metrics['recall']:.4f}  "
+            f"acc={lib_metrics['accuracy']:.4f}  ({time.time() - t0:.1f}s)"
+        )
+        baseline_results["libinjection"] = {
+            "global": lib_metrics,
+            "by_source": stratified_breakdown(
+                lib_labels, lib_preds, lib_preds.astype(float),
+                [m.get("source") for m in metas]
+            ),
+            "by_subtype": stratified_breakdown(
+                lib_labels, lib_preds, lib_preds.astype(float),
+                [m.get("subtype") for m in metas]
+            ),
+        }
+
+        # (TF-IDF baseline removed — replaced by Sequence-LSTM / Tree-LSTM
+        # checkpoints which are evaluated separately by re-invoking
+        # `evaluate.py --checkpoint results/seq_lstm/best_checkpoint.pt`.)
+
+    # ---- Save everything ----
+    np.savez(out_dir / "test_predictions.npz",
+              logits=logits, labels=labels, probs=probs, preds=preds)
+
+    result = {
+        "checkpoint": str(ckpt_path),
+        "threshold": args.threshold,
+        "three_view": {
+            "global": global_metrics,
+            "by_source": breakdowns["source"],
+            "by_subtype": breakdowns["subtype"],
+            "by_technique": breakdowns["technique"],
+        },
+        "baselines": baseline_results,
+    }
+    with open(out_dir / "evaluation.json", "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+    log.info(f"\nWrote {out_dir / 'evaluation.json'}")
 
 
 if __name__ == "__main__":

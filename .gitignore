@@ -15,14 +15,19 @@ lib/*.lib
 lib/*.exp
 *.obj
 
-# Data and cache (too large for git)
-data/wafamole/*
-data/cache/*
-!data/.gitkeep
-!data/wafamole/.gitkeep
-!data/cache/.gitkeep
+# Generated dataset artifacts (regenerate via scripts/*.py)
+data/synthesized_dataset.jsonl
+data/splits/
+data/cache/
+data/tamper_oods/
+data/adversarial/
+data/attack_pool.json
+data/benign_pool.json
+data/sqlmap_exploits.json
+data/sqliv5_eval.jsonl
+data/llm_benigns.json
 
-# Results
+# Results / training outputs
 results/
 
 # IDE / OS noise

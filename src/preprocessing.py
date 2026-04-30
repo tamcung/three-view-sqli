@@ -126,6 +126,88 @@ def serialize_ast(sql: str) -> list[str] | None:
 
 
 # ============================================================
+# Tree structure extraction (for Tree-LSTM baseline)
+# ============================================================
+def _node_label(node) -> str:
+    """Map an exp node to a single token label matching AST_VOCAB."""
+    if isinstance(node, exp.Identifier):
+        return "<ID>"
+    if isinstance(node, exp.Literal):
+        return "<STR>" if node.is_string else "<NUM>"
+    if isinstance(node, exp.Boolean):
+        return "TRUE" if node.this else "FALSE"
+    if isinstance(node, exp.Null):
+        return "NULL"
+    if isinstance(node, exp.Star):
+        return "Star"
+    if isinstance(node, exp.Func):
+        return "<FUNC>"
+    return type(node).__name__
+
+
+def serialize_ast_tree_struct(sql: str):
+    """Parse SQL and return (node_label_ids, parent_indices) in post-order
+    so that all children precede their parent (root is last).
+
+    Returns (None, None) on parse failure.
+    """
+    tree = None
+    for d in ("mysql", "postgres", "tsql"):
+        try:
+            tree = sqlglot.parse_one(sql, read=d,
+                                       error_level=sqlglot.ErrorLevel.IGNORE)
+        except Exception:
+            tree = None
+            continue
+        if tree is not None and not isinstance(tree, exp.Command):
+            break
+        tree = None
+    if tree is None:
+        return None, None
+
+    # Post-order DFS, assign incremental indices
+    labels: list[str] = []
+    parents: list[int] = []
+    # Stack-based post-order
+    stack = [(tree, False, -1)]
+    pending_parent_label_index_map = {}
+    # We use recursive Python — tree depth is bounded by SQL complexity (<100)
+    def visit(node, parent_idx):
+        if not isinstance(node, exp.Expression):
+            return None
+        # Visit children first
+        child_indices = []
+        for arg in node.args.values():
+            if isinstance(arg, list):
+                for a in arg:
+                    if isinstance(a, exp.Expression):
+                        ci = visit(a, None)  # parent set later
+                        if ci is not None:
+                            child_indices.append(ci)
+            elif isinstance(arg, exp.Expression):
+                ci = visit(arg, None)
+                if ci is not None:
+                    child_indices.append(ci)
+        # Now emit this node
+        my_idx = len(labels)
+        labels.append(_node_label(node))
+        parents.append(parent_idx)
+        # Patch children to point to me
+        for c in child_indices:
+            parents[c] = my_idx
+        return my_idx
+
+    try:
+        visit(tree, -1)
+    except RecursionError:
+        return None, None
+
+    # Convert labels to AST_VOCAB ids
+    label_ids = [AST_VOCAB.get(l, AST_VOCAB["<UNK>"]) for l in labels]
+    return label_ids, parents
+
+
+# ============================================================
 # Surface view: CodeBERT BPE tokenizer (lazy load)
 # ============================================================
 _BPE_TOKENIZER = None
@@ -140,32 +222,56 @@ def get_bpe_tokenizer():
 
 
 # ============================================================
-# Combined preprocessor
+# AST wrapper: try multiple mini-templates, take the first that parses
+# ============================================================
+# These are intentionally short/simple so the resulting AST is dominated
+# by what the user_input contributes structurally.
+AST_WRAPPERS = [
+    "SELECT * FROM t WHERE id = {slot}",        # numeric / generic
+    "SELECT * FROM t WHERE name = '{slot}'",    # string-quoted
+    "SELECT {slot} FROM t",                     # identifier
+    "SELECT * FROM t WHERE {slot}",             # SQL fragment
+]
+
+
+def serialize_ast_payload(user_input: str) -> tuple[list[str] | None, str | None]:
+    """Try wrapping user_input in each mini-template; return the first
+    serialization that succeeds, plus which wrapper worked."""
+    for wrap in AST_WRAPPERS:
+        wrapped = wrap.replace("{slot}", user_input)
+        toks = serialize_ast(wrapped)
+        if toks is not None:
+            return toks, wrap
+    return None, None
+
+
+# ============================================================
+# Payload-level three-view preprocessor
 # ============================================================
 class SamplePreprocessor:
-    """Convert one SQL string into three-view token id arrays.
+    """Convert one user_input string into three-view token id arrays.
 
-    Surface uses CodeBERT BPE (50k vocab), lengths capped at 513 (1 CLS + 512).
-    Lexical uses libinjection type codes (24 vocab), capped at 129 (1 CLS + 128).
-    AST uses bracketed pre-order with sqlglot (~85 vocab), capped at 257 (1 CLS + 256).
+    Surface: BPE on raw user_input (max 257 tokens — payloads are short).
+    Lexical: libinjection on raw user_input (libinjection's intended use).
+    AST:     parse user_input wrapped in a canonical mini-template; try
+             multiple wrappers and use the first that parses.
     """
 
-    SURFACE_MAX = 513
+    SURFACE_MAX = 257     # user_input rarely exceeds 200 chars
     LEX_MAX = 129
     AST_MAX = 257
+    CHAR_MAX = 257        # char-level baseline encoding length
 
     def __init__(self):
         self.bpe = get_bpe_tokenizer()
-        # CodeBERT (RoBERTa) tokenizer pads with id 1 by default; we'll align our
-        # PAD to its token (it has cls_token_id=0, pad_token_id=1).
         self.surface_pad = self.bpe.pad_token_id
         self.surface_cls = self.bpe.cls_token_id
         self.surface_sep = self.bpe.sep_token_id
 
-    def __call__(self, sql: str) -> dict:
+    def __call__(self, user_input: str) -> dict:
         # ---- Surface ----
         surface_enc = self.bpe(
-            sql, add_special_tokens=True,
+            user_input, add_special_tokens=True,
             max_length=self.SURFACE_MAX, truncation=True,
             return_attention_mask=True,
         )
@@ -173,21 +279,44 @@ class SamplePreprocessor:
         surface_mask = surface_enc["attention_mask"]
 
         # ---- Lexical ----
-        lex_tokens = lexicalize(sql)[: self.LEX_MAX - 1]
+        lex_tokens = lexicalize(user_input)[: self.LEX_MAX - 1]
         lex_ids = [LEX_VOCAB["<CLS>"]] + [LEX_VOCAB.get(t, LEX_VOCAB["<UNK>"]) for t in lex_tokens]
         lex_mask = [1] * len(lex_ids)
 
-        # ---- AST ----
-        ast_tokens = serialize_ast(sql)
+        # ---- AST (wrap → parse) ----
+        ast_tokens, wrapper_used = serialize_ast_payload(user_input)
         if ast_tokens is None:
             ast_ids = [AST_VOCAB["<CLS>"]]
             ast_mask = [1]
             ast_valid = 0
+            ast_node_ids: list[int] = []
+            ast_parent: list[int] = []
         else:
             ast_tokens = ast_tokens[: self.AST_MAX - 1]
             ast_ids = [AST_VOCAB["<CLS>"]] + [AST_VOCAB.get(t, AST_VOCAB["<UNK>"]) for t in ast_tokens]
             ast_mask = [1] * len(ast_ids)
             ast_valid = 1
+            # Tree structure for Tree-LSTM (use the same wrapper)
+            wrapped = (wrapper_used or AST_WRAPPERS[0]).replace("{slot}", user_input)
+            node_ids, parents = serialize_ast_tree_struct(wrapped)
+            if node_ids is None:
+                ast_node_ids, ast_parent = [], []
+            else:
+                ast_node_ids = node_ids[: self.AST_MAX - 1]
+                ast_parent = parents[: self.AST_MAX - 1]
+                # Make sure orphaned parent indices (out of truncated range)
+                # are clamped to -1 so the tree stays well-formed
+                for i, p in enumerate(ast_parent):
+                    if p >= len(ast_parent):
+                        ast_parent[i] = -1
+
+        # ---- Char-level (for CharCNN baseline) ----
+        # Each utf-8 byte → id in [1, 256], 0 reserved for PAD.
+        raw = user_input.encode("utf-8")[: self.CHAR_MAX]
+        char_ids = [b + 1 for b in raw]  # shifts 0-255 → 1-256
+        if not char_ids:
+            char_ids = [1]  # at least one token to keep collate happy
+        char_mask = [1] * len(char_ids)
 
         return {
             "surface_ids": surface_ids,
@@ -197,6 +326,10 @@ class SamplePreprocessor:
             "ast_ids": ast_ids,
             "ast_mask": ast_mask,
             "ast_valid": ast_valid,
+            "ast_node_ids": ast_node_ids,
+            "ast_parent": ast_parent,
+            "char_ids": char_ids,
+            "char_mask": char_mask,
         }
 
 

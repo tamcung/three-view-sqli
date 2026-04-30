@@ -1,0 +1,34 @@
+# Smoke test config: small subset, 1 epoch, tiny batch — checks that the
+# training pipeline runs end-to-end before launching a real run.
+#
+# Run:
+#   python train.py --config configs/smoke.yaml --output results/smoke/
+
+model_variant: three_view
+
+model:
+  surface_vocab_size: 50265
+  surface_max_len: 513
+  surface_pad_id: 1
+  lex_vocab_size: 24
+  lex_max_len: 129
+  ast_vocab_size: 100
+  ast_max_len: 257
+  d_surface: 384
+  d_abstract: 256
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+
+epochs: 1
+batch_size: 16
+lr: 2.0e-4
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.0
+amp: bf16
+
+num_workers: 0
+log_every_steps: 5
+
+max_train_samples: 2000        # subset for quick smoke test

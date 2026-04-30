@@ -1,0 +1,23 @@
+# Ablation: surface (BPE) view only — no lexical, no AST.
+
+model_variant: surface_only
+
+model:
+  surface_vocab_size: 50265
+  surface_max_len: 513
+  surface_pad_id: 1
+  d_surface: 384
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+
+epochs: 5
+batch_size: 64
+lr: 2.0e-4
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.0
+amp: bf16
+
+num_workers: 2
+log_every_steps: 50

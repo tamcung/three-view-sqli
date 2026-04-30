@@ -1,0 +1,32 @@
+# Two-view: CharCNN (surface) + Transformer (lexical libinjection tokens).
+# No AST, no de-obfuscation pre-processing.
+# Designed for local GTX 1070 Ti.
+
+model_variant: char_lex
+
+model:
+  # Char surface
+  char_vocab_size: 257
+  char_embed_dim: 64
+  char_kernel_sizes: [3, 5, 7]
+  char_num_filters: 128
+  # Lex Transformer
+  lex_vocab_size: 24
+  lex_max_len: 129
+  lex_d_model: 256
+  lex_n_layers: 4
+  lex_n_heads: 4
+  # Head
+  hidden_dim: 128
+  dropout: 0.1
+
+epochs: 5
+batch_size: 64
+lr: 5.0e-4
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.1
+amp: fp16
+
+num_workers: 2
+log_every_steps: 50

@@ -1,0 +1,24 @@
+# Sequence-LSTM baseline (Hu Xiuwen 2024 paper, "LSTM" row).
+# Single-view BPE token IDs of user_input → embedding → BiLSTM → MLP.
+
+model_variant: sequence_lstm
+
+model:
+  surface_vocab_size: 50265
+  surface_pad_id: 1
+  embed_dim: 64
+  hidden_dim: 128
+  num_layers: 1
+  bidirectional: true
+  dropout: 0.1
+
+epochs: 5
+batch_size: 64
+lr: 1.0e-3
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.0
+amp: bf16
+
+num_workers: 2
+log_every_steps: 50

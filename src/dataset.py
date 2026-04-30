@@ -1,218 +1,208 @@
 #!/usr/bin/env python3
-"""
-WAF-A-MoLE three-view dataset with on-disk caching.
+"""Three-view SQL injection dataset.
 
-Usage:
-    pre = SamplePreprocessor()
-    train_set = WafamoleDataset("train", limit_per_class=5000, preprocessor=pre)
-    loader = DataLoader(train_set, batch_size=32, collate_fn=collate_three_view, shuffle=True)
+Loads JSONL splits produced by `scripts/split_dataset.py` and converts each
+SQL string to surface / lexical / AST token-id arrays via SamplePreprocessor.
+
+Caches the preprocessed tensors so subsequent epochs are I/O-free.
 """
 from __future__ import annotations
 import json
-import os
-import random
-import time
+import logging
+import pickle
 from pathlib import Path
 
-import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 try:
     from .preprocessing import SamplePreprocessor
 except ImportError:
     from preprocessing import SamplePreprocessor
 
-# Data and cache locations are configurable via env vars (RunPod-friendly).
-WAFAMOLE_ROOT = Path(os.environ.get("WAFAMOLE_ROOT", "data/wafamole"))
-CACHE_ROOT = Path(os.environ.get("CACHE_ROOT", "data/cache"))
 
-ATTACKS = WAFAMOLE_ROOT / "attacks.sql.statements.jsonl"
-SANE = WAFAMOLE_ROOT / "sane.sql.statements.jsonl"
-CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+META_KEYS = (
+    "label",
+    "source",      # httpparams / sqliv3 / sqlmap / httpparams_norm / sqliv3_valid / llm
+    "subtype",     # for benigns: real_param / llm_keyword_in_text / llm_sql_mimicking
+    "technique",   # for sqlmap attacks: time_blind / boolean_blind / etc.
+    "id",
+    "ast_sig",
+)
 
 
-def _stream_split(path: Path, n_train: int, n_val: int, n_test: int, label: int, seed: int = 42):
-    """Yield (split_name, label, text) tuples.
+class SQLDataset(Dataset):
+    """Wraps a JSONL split. Pre-computes three-view token ids on first load.
 
-    Assigns first n_train to train, next n_val to val, next n_test to test.
-    Uses a deterministic shuffle of indices via seed.
+    Args:
+        jsonl_path: path to one of train/val/test.jsonl
+        cache_path: where to read/write the preprocessed pickle. None disables.
+        preprocessor: SamplePreprocessor instance (only used on cache miss).
+        max_samples: optional cap (debug).
     """
-    # Streaming read into list (~393k items, manageable in memory)
-    items = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            try:
-                items.append(json.loads(line)["text"])
-            except Exception:
-                continue
-    rng = random.Random(seed)
-    rng.shuffle(items)
-    splits = {
-        "train": items[:n_train],
-        "val":   items[n_train:n_train + n_val],
-        "test":  items[n_train + n_val:n_train + n_val + n_test],
-    }
-    for split_name, texts in splits.items():
-        for t in texts:
-            yield split_name, label, t
 
+    def __init__(
+        self,
+        jsonl_path: str | Path,
+        cache_path: str | Path | None = None,
+        preprocessor: SamplePreprocessor | None = None,
+        max_samples: int | None = None,
+        verbose: bool = True,
+    ):
+        self.jsonl_path = Path(jsonl_path)
+        self.cache_path = Path(cache_path) if cache_path else None
+        self._log = logging.getLogger(self.__class__.__name__)
 
-def build_split_files(
-    n_train_per_class: int,
-    n_val_per_class: int,
-    n_test_per_class: int,
-    seed: int = 42,
-    overwrite: bool = False,
-):
-    """Build train/val/test JSONL files at the given per-class sizes.
+        if self.cache_path and self.cache_path.exists():
+            if verbose:
+                self._log.info(f"Loading cached features: {self.cache_path}")
+            with open(self.cache_path, "rb") as f:
+                self.records = pickle.load(f)
+            if max_samples:
+                self.records = self.records[:max_samples]
+            return
 
-    Stored at: cache/split_{split}_seed{seed}_n{train}-{val}-{test}.jsonl
-    """
-    suffix = f"seed{seed}_n{n_train_per_class}-{n_val_per_class}-{n_test_per_class}"
-    out_paths = {
-        s: CACHE_ROOT / f"split_{s}_{suffix}.jsonl"
-        for s in ("train", "val", "test")
-    }
-    if not overwrite and all(p.exists() for p in out_paths.values()):
-        return out_paths
+        # Cache miss — preprocess from scratch
+        if preprocessor is None:
+            raise ValueError(
+                f"Cache miss for {self.jsonl_path}; pass preprocessor to build."
+            )
 
-    print(f"Building splits ({suffix}) ...")
-    files = {s: open(p, "w", encoding="utf-8") for s, p in out_paths.items()}
-    try:
-        for split, label, text in _stream_split(
-            ATTACKS, n_train_per_class, n_val_per_class, n_test_per_class, label=1, seed=seed
-        ):
-            files[split].write(json.dumps({"label": label, "text": text}, ensure_ascii=False) + "\n")
-        for split, label, text in _stream_split(
-            SANE, n_train_per_class, n_val_per_class, n_test_per_class, label=0, seed=seed + 1
-        ):
-            files[split].write(json.dumps({"label": label, "text": text}, ensure_ascii=False) + "\n")
-    finally:
-        for f in files.values():
-            f.close()
+        if verbose:
+            self._log.info(f"Preprocessing {self.jsonl_path} (cache miss)...")
 
-    for s, p in out_paths.items():
-        n = sum(1 for _ in open(p, encoding="utf-8"))
-        print(f"  {s}: {n} samples → {p}")
-    return out_paths
+        with open(self.jsonl_path, encoding="utf-8") as f:
+            raw = [json.loads(line) for line in f]
+        if max_samples:
+            raw = raw[:max_samples]
 
+        self.records = []
+        for i, rec in enumerate(raw):
+            features = preprocessor(rec["user_input"])
+            entry = {
+                **features,
+                "label_int": 1 if rec["label"] == "attack" else 0,
+                "meta": {k: rec.get(k) for k in META_KEYS},
+            }
+            self.records.append(entry)
+            if verbose and (i + 1) % 10_000 == 0:
+                self._log.info(f"  preprocessed {i + 1}/{len(raw)}")
 
-def preprocess_split_file(jsonl_path: Path, preprocessor: SamplePreprocessor, overwrite: bool = False) -> Path:
-    """Preprocess a JSONL split file into a .pt cache.
-
-    Returns path to the .pt cache.
-    """
-    cache_path = jsonl_path.with_suffix(".pt")
-    if cache_path.exists() and not overwrite:
-        return cache_path
-
-    print(f"Preprocessing {jsonl_path.name} ...")
-    samples = []
-    t0 = time.time()
-    with open(jsonl_path, encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if i % 10000 == 0 and i > 0:
-                rate = i / (time.time() - t0)
-                print(f"  {i} ({rate:.0f}/s)...")
-            obj = json.loads(line)
-            try:
-                feats = preprocessor(obj["text"])
-            except Exception as e:
-                # Fall back to all-CLS, label remains
-                feats = {
-                    "surface_ids": [preprocessor.surface_cls, preprocessor.surface_sep],
-                    "surface_mask": [1, 1],
-                    "lex_ids": [2],  # <CLS>
-                    "lex_mask": [1],
-                    "ast_ids": [2],
-                    "ast_mask": [1],
-                    "ast_valid": 0,
-                }
-            feats["label"] = obj["label"]
-            samples.append(feats)
-    print(f"  done {len(samples)} in {time.time()-t0:.0f}s")
-
-    torch.save(samples, cache_path)
-    print(f"  → {cache_path}")
-    return cache_path
-
-
-class WafamoleThreeViewDataset(Dataset):
-    """In-memory three-view dataset loaded from a preprocessed .pt cache."""
-
-    def __init__(self, cache_path: Path):
-        self.samples = torch.load(cache_path, weights_only=False)
+        if self.cache_path:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.cache_path, "wb") as f:
+                pickle.dump(self.records, f, protocol=pickle.HIGHEST_PROTOCOL)
+            if verbose:
+                self._log.info(f"Wrote cache: {self.cache_path}")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.records)
 
     def __getitem__(self, idx):
-        return self.samples[idx]
+        return self.records[idx]
 
 
-def _pad(seq: list[int], max_len: int, pad_id: int = 0) -> list[int]:
-    if len(seq) >= max_len:
-        return seq[:max_len]
-    return seq + [pad_id] * (max_len - len(seq))
+# ============================================================
+# Collate: pad each view independently to the batch's max length
+# ============================================================
+SURFACE_PAD_ID = 1   # CodeBERT/RoBERTa pad
+LEX_PAD_ID = 0
+AST_PAD_ID = 0
+CHAR_PAD_ID = 0
 
 
-def collate_three_view(batch: list[dict], surface_pad_id: int = 1) -> dict:
-    """Collate a list of preprocessed samples into a batch tensor dict.
+def _pad_field(batch: list[dict], key: str, pad_value: int) -> tuple[torch.Tensor, torch.Tensor]:
+    max_len = max(len(b[key]) for b in batch)
+    ids = torch.full((len(batch), max_len), pad_value, dtype=torch.long)
+    mask = torch.zeros((len(batch), max_len), dtype=torch.long)
+    for i, b in enumerate(batch):
+        n = len(b[key])
+        ids[i, :n] = torch.tensor(b[key], dtype=torch.long)
+        mask[i, :n] = 1
+    return ids, mask
 
-    Pads each view independently to the max length in the batch.
+
+def collate_three_view(batch: list[dict]) -> dict:
+    """Collate function — pads per-view to batch max.
+
+    For Tree-LSTM, also passes through the variable-length tree structure
+    (`ast_node_ids` and `ast_parent`) as Python lists. Most models ignore
+    these.
     """
-    max_S = max(len(b["surface_ids"]) for b in batch)
-    max_L = max(len(b["lex_ids"]) for b in batch)
-    max_A = max(len(b["ast_ids"]) for b in batch)
+    surface_ids, surface_mask = _pad_field(batch, "surface_ids", SURFACE_PAD_ID)
+    lex_ids, lex_mask = _pad_field(batch, "lex_ids", LEX_PAD_ID)
+    ast_ids, ast_mask = _pad_field(batch, "ast_ids", AST_PAD_ID)
+    # char_ids may not exist on records cached before CharCNN was added — fallback
+    if "char_ids" in batch[0]:
+        char_ids, char_mask = _pad_field(batch, "char_ids", CHAR_PAD_ID)
+    else:
+        B = len(batch)
+        char_ids = torch.zeros((B, 1), dtype=torch.long)
+        char_mask = torch.zeros((B, 1), dtype=torch.long)
 
-    out = {
-        "surface_ids":  [],
-        "surface_mask": [],
-        "lex_ids":      [],
-        "lex_mask":     [],
-        "ast_ids":      [],
-        "ast_mask":     [],
-        "ast_valid":    [],
-        "label":        [],
-    }
-    for b in batch:
-        out["surface_ids"].append(_pad(b["surface_ids"], max_S, pad_id=surface_pad_id))
-        out["surface_mask"].append(_pad(b["surface_mask"], max_S, pad_id=0))
-        out["lex_ids"].append(_pad(b["lex_ids"], max_L, pad_id=0))
-        out["lex_mask"].append(_pad(b["lex_mask"], max_L, pad_id=0))
-        out["ast_ids"].append(_pad(b["ast_ids"], max_A, pad_id=0))
-        out["ast_mask"].append(_pad(b["ast_mask"], max_A, pad_id=0))
-        out["ast_valid"].append(b["ast_valid"])
-        out["label"].append(b["label"])
+    ast_valid = torch.tensor([b["ast_valid"] for b in batch], dtype=torch.float)
+    labels = torch.tensor([b["label_int"] for b in batch], dtype=torch.long)
 
     return {
-        "surface_ids":  torch.tensor(out["surface_ids"], dtype=torch.long),
-        "surface_mask": torch.tensor(out["surface_mask"], dtype=torch.bool),
-        "lex_ids":      torch.tensor(out["lex_ids"], dtype=torch.long),
-        "lex_mask":     torch.tensor(out["lex_mask"], dtype=torch.bool),
-        "ast_ids":      torch.tensor(out["ast_ids"], dtype=torch.long),
-        "ast_mask":     torch.tensor(out["ast_mask"], dtype=torch.bool),
-        "ast_valid":    torch.tensor(out["ast_valid"], dtype=torch.long),
-        "label":        torch.tensor(out["label"], dtype=torch.long),
+        "surface_ids": surface_ids,
+        "surface_mask": surface_mask,
+        "lex_ids": lex_ids,
+        "lex_mask": lex_mask,
+        "ast_ids": ast_ids,
+        "ast_mask": ast_mask,
+        "ast_valid": ast_valid,
+        "ast_node_ids": [b.get("ast_node_ids", []) for b in batch],
+        "ast_parent":   [b.get("ast_parent", [])   for b in batch],
+        "char_ids": char_ids,
+        "char_mask": char_mask,
+        "labels": labels,
+        "meta": [b["meta"] for b in batch],
     }
+
+
+def move_batch_to(batch: dict, device: torch.device) -> dict:
+    """Move tensor fields onto device; keep `meta` (list of dicts) intact."""
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
+    return out
 
 
 if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    p = argparse.ArgumentParser()
+    p.add_argument("--split", choices=["train", "val", "test"], default="val")
+    p.add_argument("--max-samples", type=int, default=None)
+    args = p.parse_args()
+
+    ROOT = Path(__file__).resolve().parent.parent
     pre = SamplePreprocessor()
-    paths = build_split_files(n_train_per_class=2500, n_val_per_class=500, n_test_per_class=500)
-    cache_paths = {s: preprocess_split_file(p, pre) for s, p in paths.items()}
+    ds = SQLDataset(
+        jsonl_path=ROOT / "data" / "splits" / f"{args.split}.jsonl",
+        cache_path=ROOT / "data" / "cache" / f"{args.split}.pkl",
+        preprocessor=pre,
+        max_samples=args.max_samples,
+    )
+    print(f"Loaded {len(ds)} samples from {args.split}")
+    print(f"First record:")
+    r = ds[0]
+    print(f"  surface_ids[:10]: {r['surface_ids'][:10]} ... (len={len(r['surface_ids'])})")
+    print(f"  lex_ids:          {r['lex_ids'][:20]} ... (len={len(r['lex_ids'])})")
+    print(f"  ast_ids[:10]:     {r['ast_ids'][:10]} ... (len={len(r['ast_ids'])})")
+    print(f"  ast_valid:        {r['ast_valid']}")
+    print(f"  label_int:        {r['label_int']}")
+    print(f"  meta:             {r['meta']}")
 
-    ds_train = WafamoleThreeViewDataset(cache_paths["train"])
-    ds_val = WafamoleThreeViewDataset(cache_paths["val"])
-    ds_test = WafamoleThreeViewDataset(cache_paths["test"])
-    print(f"\nDataset sizes:")
-    print(f"  train: {len(ds_train)}")
-    print(f"  val:   {len(ds_val)}")
-    print(f"  test:  {len(ds_test)}")
-
-    loader = DataLoader(ds_train, batch_size=4, shuffle=True, collate_fn=collate_three_view)
+    # Collate test
+    from torch.utils.data import DataLoader
+    loader = DataLoader(ds, batch_size=4, collate_fn=collate_three_view)
     batch = next(iter(loader))
     print(f"\nBatch shapes:")
-    for k, v in batch.items():
-        print(f"  {k:15s} {tuple(v.shape)}  dtype={v.dtype}")
+    for k in ("surface_ids", "lex_ids", "ast_ids"):
+        print(f"  {k}: {batch[k].shape}")
+    print(f"  labels: {batch['labels']}")
