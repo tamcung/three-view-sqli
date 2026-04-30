@@ -233,19 +233,21 @@ def build_round_train_set(
 # Held-out adversarial eval set (built once, reused each round)
 # ============================================================
 def build_holdout_adv(seed_checkpoint, out_path, n_seeds=200,
-                      pop_size=20, generations=8, seed=999,
+                      max_rounds=50, round_size=24, seed=999,
                       seed_split=None, log=None):
-    """Use search attacker once on the seed checkpoint to make a frozen
-    held-out adversarial test set."""
+    """Use WAF-A-MoLE attacker once on the seed checkpoint to make a frozen
+    held-out adversarial test set. (Was the in-dist GA, but that gave 0%
+    ASR — useless as a held-out probe.)"""
     if out_path.exists():
         if log:
             log.info(f"  Held-out adv set already exists: {out_path}")
         return out_path
     if log:
-        log.info(f"  Building held-out adv set ({n_seeds} seeds, seed={seed})")
-    run_search_attacker(
+        log.info(f"  Building held-out adv set with WAF-A-MoLE "
+                  f"({n_seeds} seeds, seed={seed})")
+    run_wafamole_attacker(
         seed_checkpoint, out_path, n_seeds=n_seeds, seed=seed,
-        pop_size=pop_size, generations=generations,
+        max_rounds=max_rounds, round_size=round_size,
         seed_split=seed_split, log=log,
     )
     return out_path
@@ -352,7 +354,7 @@ def main():
     # ---- Build held-out adversarial eval set against the seed checkpoint ----
     holdout_dir = out_dir / "holdout_adv"
     holdout_dir.mkdir(parents=True, exist_ok=True)
-    holdout_adv_path = holdout_dir / "search_holdout.jsonl"
+    holdout_adv_path = holdout_dir / "wafamole_holdout.jsonl"
     build_holdout_adv(
         seed_ckpt, holdout_adv_path,
         n_seeds=args.holdout_adv_n,

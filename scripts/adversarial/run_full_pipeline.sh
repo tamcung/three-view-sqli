@@ -94,7 +94,7 @@ echo "================================================================"
 echo "  Stage 3: final robustness evaluation"
 echo "================================================================"
 
-ADV_LIST=("$OUT_DIR/holdout_adv/search_holdout.jsonl"
+ADV_LIST=("$OUT_DIR/holdout_adv/wafamole_holdout.jsonl"
           "$ADV_DIR/wafamole_pilot.jsonl"
           "$ADV_DIR/hotflip_pilot.jsonl")
 if [ -f "$ADV_DIR/llm_pilot.jsonl" ]; then
