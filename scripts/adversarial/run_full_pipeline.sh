@@ -78,7 +78,7 @@ python -m scripts.adversarial.co_train \
     --cap-adv-per-attacker 2000 \
     --epochs-per-round 2 \
     --lr 1e-4 \
-    --holdout-adv-n 200 \
+    --holdout-adv-n 1000 \
     --attack-seed-split data/splits/train.jsonl \
     --holdout-attack-seed-split data/splits/test.jsonl \
     --freelb \
