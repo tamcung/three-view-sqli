@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
-"""Single-view variants of ThreeViewModel for ablation studies.
+"""Single-view ablations of the proposed three-view fusion model,
+plus the model factory used by the trainer.
 
-All variants implement the same `forward(...)` signature as the full model,
-so train.py / evaluate.py can swap them via the `model_variant` config key.
+Single-view ablations (one for each of the three views in 本文方法):
+  - SurfaceOnlyModel    : BPE-only (matches surface_enc)
+  - LexicalOnlyModel    : Lex-only (matches lex_enc)
+  - CharTransformerModel: Char-only (matches char_enc inside ThreeViewFusionModel)
 
-Variants:
-  - SurfaceOnlyModel    : surface encoder + linear classifier
-  - LexicalOnlyModel    : lexical encoder + linear classifier
-  - ASTOnlyModel        : AST encoder + linear classifier
-  - SurfaceLexModel     : surface + lex (no AST view), reuse ThreeView fusion
-                          but force AST tokens to all-pad
-  - SurfaceASTModel     : surface + AST (no lex)
-  - LexASTModel         : lex + AST (no surface)
-
-Each variant keeps the same output schema as ThreeViewModel.forward() —
-{p_main, p_S, p_L, p_A, ...} — so the trainer can use the unified loss head.
-For disabled views, the corresponding aux logit is held at zero and its loss
-weight should be set to 0 in the config.
+Char-level baselines (CharCNN / CharLSTM / CharGRU) live in baseline_models.py.
+ThreeViewFusionModel (本文方法) lives in baseline_models.py.
 """
 from __future__ import annotations
 import torch
@@ -30,8 +22,6 @@ except ImportError:
 
 
 class _SingleViewModel(nn.Module):
-    """Common scaffolding for one-encoder ablations."""
-
     def __init__(self, encoder: TransformerViewEncoder, d_in: int, dropout: float = 0.1):
         super().__init__()
         self.encoder = encoder
@@ -76,6 +66,7 @@ class SurfaceOnlyModel(_SingleViewModel):
         super().__init__(enc, d_surface, dropout)
 
     def forward(self, surface_ids, surface_mask, lex_ids=None, lex_mask=None,
+                char_ids=None, char_mask=None,
                 ast_ids=None, ast_mask=None, ast_valid=None,
                 view_dropout_prob: float = 0.0):
         z = self._forward_one(surface_ids, surface_mask)
@@ -89,7 +80,7 @@ class SurfaceOnlyModel(_SingleViewModel):
 class LexicalOnlyModel(_SingleViewModel):
     def __init__(
         self,
-        lex_vocab_size: int = 24,
+        lex_vocab_size: int = 365,
         lex_max_len: int = 129,
         d_abstract: int = 256,
         n_layers: int = 4,
@@ -105,6 +96,7 @@ class LexicalOnlyModel(_SingleViewModel):
         super().__init__(enc, d_abstract, dropout)
 
     def forward(self, surface_ids=None, surface_mask=None, lex_ids=None, lex_mask=None,
+                char_ids=None, char_mask=None,
                 ast_ids=None, ast_mask=None, ast_valid=None,
                 view_dropout_prob: float = 0.0):
         z = self._forward_one(lex_ids, lex_mask)
@@ -115,99 +107,448 @@ class LexicalOnlyModel(_SingleViewModel):
                 "z_LA": zero, "z_final": zero}
 
 
-class ASTOnlyModel(_SingleViewModel):
+# ============================================================
+# Char-only single-view ablation (matches char_enc inside ThreeViewFusionModel)
+# ============================================================
+class CharTransformerModel(nn.Module):
     def __init__(
         self,
-        ast_vocab_size: int = 100,
-        ast_max_len: int = 257,
-        d_abstract: int = 256,
+        char_vocab_size: int = 257,
+        char_max_len: int = 513,
+        embed_dim: int = 128,
         n_layers: int = 4,
         n_heads: int = 4,
+        d_ff: int = 512,
         dropout: float = 0.1,
         **_ignored,
     ):
-        enc = TransformerViewEncoder(
-            vocab_size=ast_vocab_size, max_len=ast_max_len,
-            d_model=d_abstract, n_layers=n_layers, n_heads=n_heads,
-            d_ff=d_abstract * 4, dropout=dropout, pad_id=0,
+        super().__init__()
+        self.embed = nn.Embedding(char_vocab_size, embed_dim, padding_idx=0)
+        self.pos_emb = nn.Embedding(char_max_len, embed_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_heads, dim_feedforward=d_ff,
+            dropout=dropout, batch_first=True, norm_first=True,
         )
-        super().__init__(enc, d_abstract, dropout)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.classifier = nn.Sequential(
+            nn.Linear(embed_dim, 64),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
 
-    def forward(self, surface_ids=None, surface_mask=None, lex_ids=None, lex_mask=None,
+    def forward(self, char_ids=None, char_mask=None,
+                surface_ids=None, surface_mask=None,
+                lex_ids=None, lex_mask=None,
                 ast_ids=None, ast_mask=None, ast_valid=None,
                 view_dropout_prob: float = 0.0):
-        z = self._forward_one(ast_ids, ast_mask)
-        # When AST parse failed (ast_valid=0), zero the embedding so the
-        # classifier learns a sensible "missing AST" output.
-        if ast_valid is not None:
-            z = z * ast_valid.float().unsqueeze(-1)
-        p = self.classifier(z).squeeze(-1)
+        B, T = char_ids.shape
+        pos = torch.arange(T, device=char_ids.device).unsqueeze(0).expand(B, -1)
+        x = self.embed(char_ids) + self.pos_emb(pos)
+        key_padding_mask = ~char_mask.bool() if char_mask is not None else None
+        h = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        h = self.norm(h)
+        if char_mask is not None:
+            m = char_mask.float().unsqueeze(-1)
+            pooled = (h * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+        else:
+            pooled = h.mean(dim=1)
+        p = self.classifier(pooled).squeeze(-1)
         zero = torch.zeros_like(p)
-        return {"p_main": p, "p_S": zero, "p_L": zero, "p_A": p,
-                "z_S": zero, "z_L": zero, "z_A": z,
+        return {"p_main": p, "p_S": p, "p_L": zero, "p_A": zero,
+                "z_S": pooled, "z_L": zero, "z_A": zero,
                 "z_LA": zero, "z_final": zero}
 
+    def compute_loss(self, output, labels, weights=None, pos_weight=None):
+        labels = labels.float()
+        loss = F.binary_cross_entropy_with_logits(
+            output["p_main"], labels, pos_weight=pos_weight,
+        )
+        return loss, {"loss_total": loss.item(), "loss_main": loss.item(),
+                        "loss_S": 0.0, "loss_L": 0.0, "loss_A": 0.0}
+
 
 # ============================================================
-# Two-view ablations: reuse the full ThreeViewModel but mask one view
+# Char + Lex two-view fusion (leave-one-out ablation: no BPE)
 # ============================================================
-class TwoViewModel(nn.Module):
-    """Drops one view from the full three-view model. The dropped view's
-    encoder is still allocated (to keep checkpoint shape simple) but its
-    output is hard-zeroed.
+class CharLexFusionModel(nn.Module):
+    """Two-view fusion of Char + Lex (drops the BPE/surface view).
 
-    Args:
-        drop: which view to disable — 'surface' / 'lexical' / 'ast'.
-        **kwargs: same as ThreeViewModel constructor.
+    Architecture mirrors ThreeViewFusionModel but with only 2 views:
+    Char-Transformer + Lex-Transformer joined by view-type embedding,
+    then a single full self-attention fusion encoder.
     """
 
-    def __init__(self, drop: str, **kwargs):
+    def __init__(
+        self,
+        char_vocab_size: int = 257,
+        char_max_len: int = 257,
+        lex_vocab_size: int = 365,
+        lex_max_len: int = 129,
+        d_fusion: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 4,
+        fusion_layers: int = 2,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        **_ignored,
+    ):
         super().__init__()
-        try:
-            from .model import ThreeViewModel
-        except ImportError:
-            from model import ThreeViewModel
-        assert drop in ("surface", "lexical", "ast")
-        self.drop = drop
-        self.inner = ThreeViewModel(**kwargs)
 
-    def forward(self, surface_ids, surface_mask, lex_ids, lex_mask,
-                ast_ids, ast_mask, ast_valid=None,
-                view_dropout_prob: float = 0.0):
-        # Force the dropped view's input to "empty" (CLS only).
-        if self.drop == "surface":
-            B = surface_ids.size(0)
-            surface_ids = torch.zeros(B, 1, dtype=torch.long, device=surface_ids.device).fill_(
-                self.inner.surface_enc.token_emb.padding_idx or 0
-            )
-            surface_ids[:, 0] = 0  # cls position
-            surface_mask = torch.ones(B, 1, dtype=surface_mask.dtype, device=surface_mask.device)
-        elif self.drop == "lexical":
-            B = lex_ids.size(0)
-            lex_ids = torch.zeros(B, 1, dtype=torch.long, device=lex_ids.device)
-            lex_ids[:, 0] = 2  # CLS
-            lex_mask = torch.ones(B, 1, dtype=lex_mask.dtype, device=lex_mask.device)
-        elif self.drop == "ast":
-            B = ast_ids.size(0)
-            ast_ids = torch.zeros(B, 1, dtype=torch.long, device=ast_ids.device)
-            ast_ids[:, 0] = 2  # CLS
-            ast_mask = torch.ones(B, 1, dtype=ast_mask.dtype, device=ast_mask.device)
-            ast_valid = torch.zeros(B, dtype=torch.float, device=ast_ids.device)
-
-        return self.inner(
-            surface_ids, surface_mask, lex_ids, lex_mask,
-            ast_ids, ast_mask, ast_valid, view_dropout_prob,
+        self.char_enc = TransformerViewEncoder(
+            vocab_size=char_vocab_size, max_len=char_max_len,
+            d_model=d_fusion, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_fusion * 4, dropout=dropout, pad_id=0,
         )
 
-    def compute_loss(self, output, labels, weights=(0.7, 0.1, 0.1, 0.1), pos_weight=None):
-        # Zero out the dropped view's aux loss weight
-        w_main, w_S, w_L, w_A = weights
-        if self.drop == "surface": w_S = 0.0
-        if self.drop == "lexical": w_L = 0.0
-        if self.drop == "ast":     w_A = 0.0
-        return self.inner.compute_loss(
-            output, labels, weights=(w_main, w_S, w_L, w_A), pos_weight=pos_weight,
+        self.lex_enc = TransformerViewEncoder(
+            vocab_size=lex_vocab_size, max_len=lex_max_len,
+            d_model=d_fusion, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_fusion * 4, dropout=dropout, pad_id=0,
         )
+
+        self.view_emb = nn.Embedding(2, d_fusion)
+
+        fusion_layer = nn.TransformerEncoderLayer(
+            d_model=d_fusion, nhead=n_heads,
+            dim_feedforward=d_fusion * 4,
+            dropout=dropout, activation="gelu",
+            batch_first=True, norm_first=True,
+        )
+        self.fusion_encoder = nn.TransformerEncoder(fusion_layer, num_layers=fusion_layers)
+
+        self.aux_L = nn.Linear(d_fusion, 1)
+        self.aux_C = nn.Linear(d_fusion, 1)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(d_fusion, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    @staticmethod
+    def _masked_mean(seq, mask):
+        m = mask.unsqueeze(-1).float()
+        s = (seq * m).sum(dim=1)
+        n = m.sum(dim=1).clamp(min=1)
+        return s / n
+
+    def forward(self, surface_ids=None, surface_mask=None,
+                lex_ids=None, lex_mask=None,
+                char_ids=None, char_mask=None,
+                ast_ids=None, ast_mask=None, ast_valid=None,
+                view_dropout_prob: float = 0.0,
+                surface_inputs_embeds=None):
+        if char_mask is None:
+            char_mask = (char_ids != 0).long()
+        c_out = self.char_enc(char_ids, char_mask)
+        z_C = c_out["pooled"]
+        H_C = c_out["full"]
+
+        l_out = self.lex_enc(lex_ids, lex_mask)
+        z_L = l_out["pooled"]
+        H_L = l_out["full"]
+
+        p_L = self.aux_L(z_L).squeeze(-1)
+        p_C = self.aux_C(z_C).squeeze(-1)
+
+        dev = H_L.device
+        B = H_L.size(0)
+        v_L = self.view_emb(torch.tensor(0, device=dev))
+        v_C = self.view_emb(torch.tensor(1, device=dev))
+        H_L_t = H_L + v_L
+        H_C_t = H_C + v_C
+
+        if self.training and view_dropout_prob > 0:
+            keep_L = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            keep_C = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            H_L_t = H_L_t * keep_L
+            H_C_t = H_C_t * keep_C
+
+        if lex_mask is None:
+            lex_mask = (lex_ids != 0).long()
+
+        fused = torch.cat([H_L_t, H_C_t], dim=1)
+        joint_mask = torch.cat([lex_mask, char_mask], dim=1)
+        joint_pad = ~joint_mask.bool()
+
+        out = self.fusion_encoder(fused, src_key_padding_mask=joint_pad)
+        z_final = self._masked_mean(out, joint_mask)
+        p_main = self.classifier(z_final).squeeze(-1)
+
+        zero = torch.zeros_like(p_main)
+        return {
+            "p_main": p_main,
+            "p_S": zero, "p_L": p_L, "p_A": p_C,
+            "z_S": zero, "z_L": z_L, "z_A": z_C,
+            "z_LA": z_final, "z_final": z_final,
+        }
+
+    def compute_loss(self, output, labels,
+                       weights=(0.7, 0.0, 0.15, 0.15), pos_weight=None):
+        labels = labels.float()
+        w_main, w_S, w_L, w_C = weights
+        def bce(logits):
+            return F.binary_cross_entropy_with_logits(
+                logits, labels, pos_weight=pos_weight)
+        loss_main = bce(output["p_main"])
+        loss_L = bce(output["p_L"])
+        loss_C = bce(output["p_A"])
+        total = w_main * loss_main + w_L * loss_L + w_C * loss_C
+        return total, {
+            "loss_total": total.item(),
+            "loss_main": loss_main.item(),
+            "loss_S": 0.0,
+            "loss_L": loss_L.item(),
+            "loss_A": loss_C.item(),
+        }
+
+
+# ============================================================
+# BPE + Lex two-view fusion (leave-one-out: no Char)
+# ============================================================
+class BPELexFusionModel(nn.Module):
+    def __init__(
+        self,
+        surface_vocab_size: int = 50265,
+        surface_max_len: int = 257,
+        surface_pad_id: int = 1,
+        d_surface: int = 384,
+        lex_vocab_size: int = 365,
+        lex_max_len: int = 129,
+        d_fusion: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 4,
+        fusion_layers: int = 2,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        **_ignored,
+    ):
+        super().__init__()
+        self.surface_enc = TransformerViewEncoder(
+            vocab_size=surface_vocab_size, max_len=surface_max_len,
+            d_model=d_surface, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_surface * 4, dropout=dropout, pad_id=surface_pad_id,
+        )
+        self.surface_proj = nn.Linear(d_surface, d_fusion)
+
+        self.lex_enc = TransformerViewEncoder(
+            vocab_size=lex_vocab_size, max_len=lex_max_len,
+            d_model=d_fusion, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_fusion * 4, dropout=dropout, pad_id=0,
+        )
+
+        self.view_emb = nn.Embedding(2, d_fusion)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_fusion, nhead=n_heads,
+            dim_feedforward=d_fusion * 4, dropout=dropout,
+            activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.fusion_encoder = nn.TransformerEncoder(layer, num_layers=fusion_layers)
+
+        self.aux_S = nn.Linear(d_surface, 1)
+        self.aux_L = nn.Linear(d_fusion, 1)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(d_fusion, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    @staticmethod
+    def _masked_mean(seq, mask):
+        m = mask.unsqueeze(-1).float()
+        return (seq * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+
+    def forward(self, surface_ids=None, surface_mask=None,
+                lex_ids=None, lex_mask=None,
+                char_ids=None, char_mask=None,
+                ast_ids=None, ast_mask=None, ast_valid=None,
+                view_dropout_prob: float = 0.0,
+                surface_inputs_embeds=None):
+        if surface_inputs_embeds is not None:
+            s_out = self.surface_enc(input_ids=None, attention_mask=surface_mask,
+                                      inputs_embeds=surface_inputs_embeds)
+        else:
+            s_out = self.surface_enc(surface_ids, surface_mask)
+        z_S = s_out["pooled"]
+        H_S = self.surface_proj(s_out["full"])
+
+        l_out = self.lex_enc(lex_ids, lex_mask)
+        z_L = l_out["pooled"]
+        H_L = l_out["full"]
+
+        p_S = self.aux_S(z_S).squeeze(-1)
+        p_L = self.aux_L(z_L).squeeze(-1)
+
+        dev = H_S.device
+        B = H_S.size(0)
+        v_S = self.view_emb(torch.tensor(0, device=dev))
+        v_L = self.view_emb(torch.tensor(1, device=dev))
+        H_S_t = H_S + v_S
+        H_L_t = H_L + v_L
+
+        if self.training and view_dropout_prob > 0:
+            keep_S = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            keep_L = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            H_S_t = H_S_t * keep_S
+            H_L_t = H_L_t * keep_L
+
+        if lex_mask is None:
+            lex_mask = (lex_ids != 0).long()
+
+        fused = torch.cat([H_S_t, H_L_t], dim=1)
+        joint_mask = torch.cat([surface_mask, lex_mask], dim=1)
+        out = self.fusion_encoder(fused, src_key_padding_mask=~joint_mask.bool())
+        z_final = self._masked_mean(out, joint_mask)
+        p_main = self.classifier(z_final).squeeze(-1)
+
+        zero = torch.zeros_like(p_main)
+        return {"p_main": p_main, "p_S": p_S, "p_L": p_L, "p_A": zero,
+                "z_S": z_S, "z_L": z_L, "z_A": zero,
+                "z_LA": z_final, "z_final": z_final}
+
+    def compute_loss(self, output, labels,
+                       weights=(0.7, 0.15, 0.15, 0.0), pos_weight=None):
+        labels = labels.float()
+        w_main, w_S, w_L, w_C = weights
+        def bce(logits):
+            return F.binary_cross_entropy_with_logits(
+                logits, labels, pos_weight=pos_weight)
+        loss_main = bce(output["p_main"])
+        loss_S = bce(output["p_S"])
+        loss_L = bce(output["p_L"])
+        total = w_main * loss_main + w_S * loss_S + w_L * loss_L
+        return total, {
+            "loss_total": total.item(), "loss_main": loss_main.item(),
+            "loss_S": loss_S.item(), "loss_L": loss_L.item(), "loss_A": 0.0,
+        }
+
+
+# ============================================================
+# BPE + Char two-view fusion (leave-one-out: no Lex)
+# ============================================================
+class BPECharFusionModel(nn.Module):
+    def __init__(
+        self,
+        surface_vocab_size: int = 50265,
+        surface_max_len: int = 257,
+        surface_pad_id: int = 1,
+        d_surface: int = 384,
+        char_vocab_size: int = 257,
+        char_max_len: int = 257,
+        d_fusion: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 4,
+        fusion_layers: int = 2,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        **_ignored,
+    ):
+        super().__init__()
+        self.surface_enc = TransformerViewEncoder(
+            vocab_size=surface_vocab_size, max_len=surface_max_len,
+            d_model=d_surface, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_surface * 4, dropout=dropout, pad_id=surface_pad_id,
+        )
+        self.surface_proj = nn.Linear(d_surface, d_fusion)
+
+        self.char_enc = TransformerViewEncoder(
+            vocab_size=char_vocab_size, max_len=char_max_len,
+            d_model=d_fusion, n_layers=n_layers, n_heads=n_heads,
+            d_ff=d_fusion * 4, dropout=dropout, pad_id=0,
+        )
+
+        self.view_emb = nn.Embedding(2, d_fusion)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_fusion, nhead=n_heads,
+            dim_feedforward=d_fusion * 4, dropout=dropout,
+            activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.fusion_encoder = nn.TransformerEncoder(layer, num_layers=fusion_layers)
+
+        self.aux_S = nn.Linear(d_surface, 1)
+        self.aux_C = nn.Linear(d_fusion, 1)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(d_fusion, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    @staticmethod
+    def _masked_mean(seq, mask):
+        m = mask.unsqueeze(-1).float()
+        return (seq * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)
+
+    def forward(self, surface_ids=None, surface_mask=None,
+                lex_ids=None, lex_mask=None,
+                char_ids=None, char_mask=None,
+                ast_ids=None, ast_mask=None, ast_valid=None,
+                view_dropout_prob: float = 0.0,
+                surface_inputs_embeds=None):
+        if surface_inputs_embeds is not None:
+            s_out = self.surface_enc(input_ids=None, attention_mask=surface_mask,
+                                      inputs_embeds=surface_inputs_embeds)
+        else:
+            s_out = self.surface_enc(surface_ids, surface_mask)
+        z_S = s_out["pooled"]
+        H_S = self.surface_proj(s_out["full"])
+
+        if char_mask is None:
+            char_mask = (char_ids != 0).long()
+        c_out = self.char_enc(char_ids, char_mask)
+        z_C = c_out["pooled"]
+        H_C = c_out["full"]
+
+        p_S = self.aux_S(z_S).squeeze(-1)
+        p_C = self.aux_C(z_C).squeeze(-1)
+
+        dev = H_S.device
+        B = H_S.size(0)
+        v_S = self.view_emb(torch.tensor(0, device=dev))
+        v_C = self.view_emb(torch.tensor(1, device=dev))
+        H_S_t = H_S + v_S
+        H_C_t = H_C + v_C
+
+        if self.training and view_dropout_prob > 0:
+            keep_S = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            keep_C = (torch.rand(B, device=dev) > view_dropout_prob).float().view(B, 1, 1)
+            H_S_t = H_S_t * keep_S
+            H_C_t = H_C_t * keep_C
+
+        fused = torch.cat([H_S_t, H_C_t], dim=1)
+        joint_mask = torch.cat([surface_mask, char_mask], dim=1)
+        out = self.fusion_encoder(fused, src_key_padding_mask=~joint_mask.bool())
+        z_final = self._masked_mean(out, joint_mask)
+        p_main = self.classifier(z_final).squeeze(-1)
+
+        zero = torch.zeros_like(p_main)
+        return {"p_main": p_main, "p_S": p_S, "p_L": zero, "p_A": p_C,
+                "z_S": z_S, "z_L": zero, "z_A": z_C,
+                "z_LA": z_final, "z_final": z_final}
+
+    def compute_loss(self, output, labels,
+                       weights=(0.7, 0.15, 0.0, 0.15), pos_weight=None):
+        labels = labels.float()
+        w_main, w_S, w_L, w_C = weights
+        def bce(logits):
+            return F.binary_cross_entropy_with_logits(
+                logits, labels, pos_weight=pos_weight)
+        loss_main = bce(output["p_main"])
+        loss_S = bce(output["p_S"])
+        loss_C = bce(output["p_A"])
+        total = w_main * loss_main + w_S * loss_S + w_C * loss_C
+        return total, {
+            "loss_total": total.item(), "loss_main": loss_main.item(),
+            "loss_S": loss_S.item(), "loss_L": 0.0, "loss_A": loss_C.item(),
+        }
 
 
 # ============================================================
@@ -216,82 +557,55 @@ class TwoViewModel(nn.Module):
 def build_model(variant: str, model_kwargs: dict) -> nn.Module:
     """Instantiate a model variant by name."""
     variant = variant.lower()
-    if variant in ("three_view", "full", "default", ""):
+
+    # Three-view fusion (本文方法) — accepts several aliases
+    if variant in ("three_view", "tri_view", "fusion", "default", ""):
         try:
-            from .model import ThreeViewModel
+            from .baseline_models import ThreeViewFusionModel
         except ImportError:
-            from model import ThreeViewModel
-        return ThreeViewModel(**model_kwargs)
-    if variant == "surface_only":
+            from baseline_models import ThreeViewFusionModel
+        return ThreeViewFusionModel(**model_kwargs)
+
+    # Single-view ablations
+    if variant in ("surface_only", "bpe_only"):
         return SurfaceOnlyModel(**model_kwargs)
-    if variant == "lexical_only":
+    if variant in ("lexical_only", "lex_only"):
         return LexicalOnlyModel(**model_kwargs)
-    if variant == "ast_only":
-        return ASTOnlyModel(**model_kwargs)
-    if variant == "no_surface":
-        return TwoViewModel(drop="surface", **model_kwargs)
-    if variant == "no_lexical":
-        return TwoViewModel(drop="lexical", **model_kwargs)
-    if variant == "no_ast":
-        return TwoViewModel(drop="ast", **model_kwargs)
-    if variant == "sequence_lstm":
-        try:
-            from .baseline_models import SequenceLSTMModel
-        except ImportError:
-            from baseline_models import SequenceLSTMModel
-        return SequenceLSTMModel(**model_kwargs)
-    if variant == "tree_lstm":
-        try:
-            from .baseline_models import TreeLSTMModel
-        except ImportError:
-            from baseline_models import TreeLSTMModel
-        return TreeLSTMModel(**model_kwargs)
+
+    # Char-* baselines
     if variant in ("char_cnn", "charcnn"):
         try:
             from .baseline_models import CharCNNModel
         except ImportError:
             from baseline_models import CharCNNModel
         return CharCNNModel(**model_kwargs)
-    if variant in ("char_bilstm", "charbilstm"):
+    if variant in ("char_lstm", "charlstm"):
         try:
-            from .baseline_models import CharBiLSTMModel
+            from .baseline_models import CharLSTMModel
         except ImportError:
-            from baseline_models import CharBiLSTMModel
-        return CharBiLSTMModel(**model_kwargs)
-    if variant in ("char_lex", "charlex"):
+            from baseline_models import CharLSTMModel
+        return CharLSTMModel(**model_kwargs)
+    if variant in ("char_gru", "chargru"):
         try:
-            from .baseline_models import CharLexModel
+            from .baseline_models import CharGRUModel
         except ImportError:
-            from baseline_models import CharLexModel
-        return CharLexModel(**model_kwargs)
-    if variant in ("char_lex_xattn", "charlexxattn"):
+            from baseline_models import CharGRUModel
+        return CharGRUModel(**model_kwargs)
+    if variant in ("char_transformer", "chartransformer"):
+        return CharTransformerModel(**model_kwargs)
+    if variant in ("mvc_bicnn", "mvcbicnn"):
         try:
-            from .baseline_models import CharLexCrossAttnModel
+            from .baseline_models import MVCBiCNNModel
         except ImportError:
-            from baseline_models import CharLexCrossAttnModel
-        return CharLexCrossAttnModel(**model_kwargs)
-    if variant in ("bpe_char_lex", "tri_view"):
-        try:
-            from .baseline_models import BPECharLexModel
-        except ImportError:
-            from baseline_models import BPECharLexModel
-        return BPECharLexModel(**model_kwargs)
-    if variant in ("bpe_char_lex_stage", "tri_view_stage"):
-        try:
-            from .baseline_models import BPECharLexStageModel
-        except ImportError:
-            from baseline_models import BPECharLexStageModel
-        return BPECharLexStageModel(**model_kwargs)
-    if variant in ("bpe_char_lex_full_stage", "tri_view_full_stage"):
-        try:
-            from .baseline_models import BPECharLexFullStageModel
-        except ImportError:
-            from baseline_models import BPECharLexFullStageModel
-        return BPECharLexFullStageModel(**model_kwargs)
-    if variant in ("bpe_char_lex_full_attn", "tri_view_full_attn"):
-        try:
-            from .baseline_models import BPECharLexFullAttnModel
-        except ImportError:
-            from baseline_models import BPECharLexFullAttnModel
-        return BPECharLexFullAttnModel(**model_kwargs)
+            from baseline_models import MVCBiCNNModel
+        return MVCBiCNNModel(**model_kwargs)
+
+    # Two-view leave-one-out ablations
+    if variant in ("char_lex_fusion", "no_bpe"):
+        return CharLexFusionModel(**model_kwargs)
+    if variant in ("bpe_lex_fusion", "no_char"):
+        return BPELexFusionModel(**model_kwargs)
+    if variant in ("bpe_char_fusion", "no_lex"):
+        return BPECharFusionModel(**model_kwargs)
+
     raise ValueError(f"Unknown model_variant: {variant}")
