@@ -1,0 +1,42 @@
+# Chapter 4 adversarial training — base config (used by all 4 strategies).
+# Strategy is selected via train_adv.py --strategy {clean|aug|freelb|combined}.
+# Mirrors configs/three_view_fusion_d128_L2.yaml but with epochs reduced to 3
+# for adversarial fine-tuning from the §3 best checkpoint, and adds the
+# `freelb:` block consumed by FreeLB inner-PGD.
+
+model_variant: three_view
+
+model:
+  surface_vocab_size: 50265
+  surface_max_len: 257
+  surface_pad_id: 1
+  d_surface: 384
+  char_vocab_size: 257
+  char_max_len: 257
+  lex_vocab_size: 365
+  lex_max_len: 129
+  d_fusion: 128
+  n_heads: 4
+  n_layers: 4
+  fusion_layers: 2
+  hidden_dim: 64
+  dropout: 0.1
+
+# Fine-tuning from ch3 best ckpt — 3 epochs is usually enough for FreeLB
+# adversarial training to converge on this setup; raise to 5 for clean baseline.
+epochs: 3
+batch_size: 16
+lr: 5.0e-5            # smaller than ch3 (2e-4) since we warm-start
+weight_decay: 0.01
+warmup_frac: 0.05
+view_dropout: 0.1
+amp: fp16
+
+freelb:
+  K: 3                # inner PGD steps (Kakisim §4.4 default)
+  epsilon: 0.10        # ε ball radius (chapter 4 default; ablation: 0.05/0.10/0.20/0.50)
+  alpha: 0.03         # step size (≈ ε / K)
+  lambda: 1.0         # weight on adversarial loss term (eq. 4.8 λ)
+
+num_workers: 2
+log_every_steps: 100
