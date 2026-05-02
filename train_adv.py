@@ -135,12 +135,12 @@ def freelb_step(model, batch, K: int, epsilon: float, alpha: float,
     """One FreeLB step over a batch, accumulating gradients and stepping
     optimiser at the end. Returns dict of loss components.
 
-    Implements §4.4 Algorithm 4.2:
-      - encode three views (with grad on encoders)
-      - inner loop K times:
-          add δ to each view, compute loss, scale by 1/(K+1) + λ, backward
-          update δ along its gradient sign, project to ε-ball
-      - one extra "clean" forward (δ=0) for L_clean
+    Implements §4.4 Algorithm 4.2 with a single-backward-per-iteration
+    pattern that avoids "backward through graph twice" errors:
+      - encode three views once (encoder graph kept alive across K iters)
+      - K-1 iterations: scaled adv-loss.backward(retain_graph=True), update δ
+      - last iteration: combine final adv-loss + clean-loss into one
+        backward() (no retain_graph; graph is freed exactly once)
       - optimizer.step()
     """
     optimizer.zero_grad(set_to_none=True)
@@ -152,20 +152,11 @@ def freelb_step(model, batch, K: int, epsilon: float, alpha: float,
         char_ids=batch.get("char_ids"), char_mask=batch.get("char_mask"),
     )
     labels = batch["labels"].float()
-
-    # ---- Clean loss (δ=0) ----
-    fused_clean = model.fuse_from_views(
-        H_S, H_C, H_L,
-        surface_mask=batch["surface_mask"], lex_mask=batch["lex_mask"],
-        char_mask=batch.get("char_mask"), view_dropout_prob=view_dropout_prob,
-    )
-    p_main_clean = fused_clean["p_main"]
-    loss_clean = F.binary_cross_entropy_with_logits(p_main_clean, labels)
+    sm = batch["surface_mask"]; lm = batch["lex_mask"]; cm = batch.get("char_mask")
 
     # ---- Initialise δ as small random tensors with requires_grad ----
     def _rand_delta(H, eps):
         d = torch.randn_like(H) * eps * 0.1
-        # project to ε-ball (per-sample L2)
         norm = d.view(d.size(0), -1).norm(dim=-1).view(-1, 1, 1).clamp(min=1e-8)
         d = d * (eps / norm).clamp(max=1.0)
         return d.detach().requires_grad_(True)
@@ -174,39 +165,52 @@ def freelb_step(model, batch, K: int, epsilon: float, alpha: float,
     delta_C = _rand_delta(H_C, epsilon)
     delta_L = _rand_delta(H_L, epsilon)
 
-    # ---- Inner PGD loop over K steps, accumulating grad on model params ----
-    adv_losses = []
-    for k in range(K):
+    def _project_and_step(d):
+        if d.grad is None:
+            return
+        with torch.no_grad():
+            gnorm = d.grad.view(d.size(0), -1).norm(dim=-1).view(-1, 1, 1).clamp(min=1e-8)
+            d.add_(alpha * d.grad / gnorm)
+            dnorm = d.view(d.size(0), -1).norm(dim=-1).view(-1, 1, 1).clamp(min=1e-8)
+            d.mul_((epsilon / dnorm).clamp(max=1.0))
+            d.grad.zero_()
+
+    adv_losses: list[float] = []
+
+    # ---- K-1 inner adv-backward steps, each retaining graph ----
+    for k in range(max(K - 1, 0)):
         fused = model.fuse_from_views(
             H_S + delta_S, H_C + delta_C, H_L + delta_L,
-            surface_mask=batch["surface_mask"], lex_mask=batch["lex_mask"],
-            char_mask=batch.get("char_mask"), view_dropout_prob=view_dropout_prob,
+            surface_mask=sm, lex_mask=lm, char_mask=cm,
+            view_dropout_prob=view_dropout_prob,
         )
-        loss_k = F.binary_cross_entropy_with_logits(fused["p_main"], labels)
-        adv_losses.append(loss_k.detach().item())
+        loss_adv_k = F.binary_cross_entropy_with_logits(fused["p_main"], labels)
+        adv_losses.append(float(loss_adv_k.detach().item()))
+        # Backward this step's contribution: (λ/K) · L_adv_k
+        (loss_adv_k * (lambda_adv / max(K, 1))).backward(retain_graph=True)
+        _project_and_step(delta_S)
+        _project_and_step(delta_C)
+        _project_and_step(delta_L)
 
-        # Compute gradient w.r.t. δ (and accumulate into model params)
-        grads = torch.autograd.grad(
-            loss_k * (lambda_adv / max(K, 1)),
-            [delta_S, delta_C, delta_L],
-            retain_graph=True, create_graph=False, allow_unused=True,
-        )
-        # Manually trigger model-param backward for this scaled loss
-        (loss_k * (lambda_adv / max(K, 1))).backward(retain_graph=False)
+    # ---- Final combined backward: last-step adv loss + clean loss ----
+    fused_last = model.fuse_from_views(
+        H_S + delta_S, H_C + delta_C, H_L + delta_L,
+        surface_mask=sm, lex_mask=lm, char_mask=cm,
+        view_dropout_prob=view_dropout_prob,
+    )
+    loss_adv_last = F.binary_cross_entropy_with_logits(fused_last["p_main"], labels)
+    adv_losses.append(float(loss_adv_last.detach().item()))
 
-        # Update δ along normalised gradient sign, project to ε-ball
-        with torch.no_grad():
-            for d, g in zip([delta_S, delta_C, delta_L], grads):
-                if g is None: continue
-                gnorm = g.view(g.size(0), -1).norm(dim=-1).view(-1, 1, 1).clamp(min=1e-8)
-                d.add_(alpha * g / gnorm)
-                # Project
-                dnorm = d.view(d.size(0), -1).norm(dim=-1).view(-1, 1, 1).clamp(min=1e-8)
-                d.mul_((epsilon / dnorm).clamp(max=1.0))
-                if d.grad is not None: d.grad.zero_()
+    fused_clean = model.fuse_from_views(
+        H_S, H_C, H_L,
+        surface_mask=sm, lex_mask=lm, char_mask=cm,
+        view_dropout_prob=view_dropout_prob,
+    )
+    loss_clean = F.binary_cross_entropy_with_logits(fused_clean["p_main"], labels)
 
-    # ---- Add clean loss gradient ----
-    loss_clean.backward()
+    # Single combined backward — last walk through encoder graph, then freed.
+    total_grad_loss = loss_clean + (lambda_adv / max(K, 1)) * loss_adv_last
+    total_grad_loss.backward()
 
     optimizer.step()
 
