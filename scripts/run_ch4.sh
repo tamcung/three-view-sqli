@@ -9,10 +9,16 @@
 #
 # Run all stages:                bash scripts/run_ch4.sh all
 # Run a single stage:            bash scripts/run_ch4.sh stage1
+#                                bash scripts/run_ch4.sh stage1b   # eval adv set
 #                                bash scripts/run_ch4.sh stage2
 #                                bash scripts/run_ch4.sh stage3
 #                                bash scripts/run_ch4.sh stage4
 # Run ε ablation only:           bash scripts/run_ch4.sh ablate-eps
+#
+# Two adversarial sets are kept disjoint by construction to avoid evaluation
+# leakage (aug/combined strategies train on round0.jsonl):
+#   round0.jsonl       — generated from TRAIN seeds, used for training augmentation
+#   round0_eval.jsonl  — generated from TEST seeds, used only for evaluation
 #
 # Pre-requisites on RunPod:
 #   - The §3 best checkpoint must already exist:
@@ -51,14 +57,32 @@ ATTACK_ARGS=(
 
 
 # -----------------------------------------------------------
-# Stage 1: generate adversarial samples (round 0) from §3 model
+# Stage 1: generate training-side adversarial samples (round 0) from §3 model
+# Seeds: train.jsonl  →  used by aug / combined as augmentation data.
 # -----------------------------------------------------------
 stage1() {
-  echo "=== Stage 1: generate round-0 adversarial samples ==="
+  echo "=== Stage 1: generate round-0 adversarial samples (TRAIN seeds) ==="
   python -u src/adv_generator.py \
     --ckpt-dir "$BASE_CKPT" \
     --input "$TRAIN_JSONL" \
     --output "$ADV_DIR/round0.jsonl" \
+    "${ATTACK_ARGS[@]}"
+}
+
+
+# -----------------------------------------------------------
+# Stage 1b: generate evaluation-only adversarial samples from §3 model
+# Seeds: test.jsonl  →  used ONLY by stage 3 evaluation. Disjoint from
+# round0.jsonl by construction (different seed pool), so aug/combined
+# never see these during training. This is a one-shot fixed eval set
+# that all four strategies (and stage-4 round-r models) are scored on.
+# -----------------------------------------------------------
+stage1b() {
+  echo "=== Stage 1b: generate evaluation adversarial samples (TEST seeds) ==="
+  python -u src/adv_generator.py \
+    --ckpt-dir "$BASE_CKPT" \
+    --input "$TEST_JSONL" \
+    --output "$ADV_DIR/round0_eval.jsonl" \
     "${ATTACK_ARGS[@]}"
 }
 
@@ -107,8 +131,12 @@ eval_one() {
 
 stage3() {
   echo "=== Stage 3: evaluate 4 strategies on clean + adv test ==="
+  if [[ ! -f "$ADV_DIR/round0_eval.jsonl" ]]; then
+    echo "ERROR: $ADV_DIR/round0_eval.jsonl missing — run stage1b first" >&2
+    exit 1
+  fi
   for s in clean aug freelb combined; do
-    eval_one "$RESULTS_DIR/$s" "$ADV_DIR/round0.jsonl"
+    eval_one "$RESULTS_DIR/$s" "$ADV_DIR/round0_eval.jsonl"
   done
 }
 
@@ -121,13 +149,20 @@ stage4() {
   echo "=== Stage 4: iterative loop, $((ROUNDS-1)) more rounds ==="
   for r in $(seq 1 $((ROUNDS-1))); do
     echo "--- Round $r ---"
-    # 4.1 attack the current model
+    # 4.1 attack current model with TRAIN seeds → training-side adv set
     python -u src/adv_generator.py \
       --ckpt-dir "$current" \
       --input "$TRAIN_JSONL" \
       --output "$ADV_DIR/round${r}.jsonl" \
       "${ATTACK_ARGS[@]}"
-    # 4.2 train next-round model from current ckpt
+    # 4.2 attack current model with TEST seeds → evaluation-only adv set
+    #     (used both for ASR_r curve and for the round-r model's adv F1)
+    python -u src/adv_generator.py \
+      --ckpt-dir "$current" \
+      --input "$TEST_JSONL" \
+      --output "$ADV_DIR/round${r}_eval.jsonl" \
+      "${ATTACK_ARGS[@]}"
+    # 4.3 train next-round model from current ckpt using train-side adv
     local next_dir="$RESULTS_DIR/combined_round${r}"
     python -u train_adv.py \
       --config "$CONFIG" \
@@ -138,8 +173,8 @@ stage4() {
       --val-jsonl "$VAL_JSONL" \
       --test-jsonl "$TEST_JSONL" \
       --init-ckpt "$current/best_checkpoint.pt"
-    # 4.3 eval next-round model on this round's adv set
-    eval_one "$next_dir" "$ADV_DIR/round${r}.jsonl"
+    # 4.4 evaluate the new round-r model on its own held-out eval adv set
+    eval_one "$next_dir" "$ADV_DIR/round${r}_eval.jsonl"
     current="$next_dir"
   done
 }
@@ -169,7 +204,7 @@ print('wrote', '$cfg_file')
       --val-jsonl "$VAL_JSONL" \
       --test-jsonl "$TEST_JSONL" \
       --init-ckpt "$BASE_CKPT/best_checkpoint.pt"
-    eval_one "$out_dir" "$ADV_DIR/round0.jsonl"
+    eval_one "$out_dir" "$ADV_DIR/round0_eval.jsonl"
   done
 }
 
@@ -179,12 +214,13 @@ print('wrote', '$cfg_file')
 # -----------------------------------------------------------
 case "${1:-all}" in
   stage1) stage1 ;;
+  stage1b) stage1b ;;
   stage2) stage2 ;;
   stage3) stage3 ;;
   stage4) stage4 ;;
   ablate-eps) ablate_eps ;;
-  all) stage1; stage2; stage3; stage4 ;;
-  *) echo "Usage: $0 {stage1|stage2|stage3|stage4|ablate-eps|all}"; exit 1 ;;
+  all) stage1; stage1b; stage2; stage3; stage4 ;;
+  *) echo "Usage: $0 {stage1|stage1b|stage2|stage3|stage4|ablate-eps|all}"; exit 1 ;;
 esac
 
 echo "=== Done ==="
