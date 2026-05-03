@@ -462,12 +462,18 @@ class ThreeViewFusionModel(nn.Module):
     def encode_views(self, surface_ids=None, surface_mask=None,
                      lex_ids=None, lex_mask=None,
                      char_ids=None, char_mask=None,
-                     surface_inputs_embeds=None):
+                     surface_inputs_embeds=None,
+                     char_inputs_embeds=None,
+                     lex_inputs_embeds=None):
         """Run the three view encoders only. Returns:
           H_S [B, L_S, d_fusion]  (post surface_proj)
           H_C [B, L_C, d_fusion]
           H_L [B, L_L, d_fusion]
           aux: {p_S, p_L, p_A, z_S, z_L, z_C}  (auxiliary classifier logits)
+
+        Each ``*_inputs_embeds`` arg, if provided, replaces the token-id
+        embedding lookup in the corresponding encoder. This is the entry
+        point for token-embedding-level FreeLB perturbation.
         """
         if surface_inputs_embeds is not None:
             s_out = self.surface_enc(
@@ -481,11 +487,23 @@ class ThreeViewFusionModel(nn.Module):
 
         if char_mask is None and char_ids is not None:
             char_mask = (char_ids != 0).long()
-        c_out = self.char_enc(char_ids, char_mask)
+        if char_inputs_embeds is not None:
+            c_out = self.char_enc(
+                input_ids=None, attention_mask=char_mask,
+                inputs_embeds=char_inputs_embeds,
+            )
+        else:
+            c_out = self.char_enc(char_ids, char_mask)
         z_C = c_out["pooled"]
         H_C = c_out["full"]
 
-        l_out = self.lex_enc(lex_ids, lex_mask)
+        if lex_inputs_embeds is not None:
+            l_out = self.lex_enc(
+                input_ids=None, attention_mask=lex_mask,
+                inputs_embeds=lex_inputs_embeds,
+            )
+        else:
+            l_out = self.lex_enc(lex_ids, lex_mask)
         z_L = l_out["pooled"]
         H_L = l_out["full"]
 

@@ -132,38 +132,46 @@ def build_adv_records(adv_jsonl: Path, preprocessor):
 # ============================================================
 def freelb_step(model, batch, K: int, epsilon: float, alpha: float,
                 lambda_adv: float, optimizer, view_dropout_prob: float):
-    """One FreeLB step over a batch, accumulating gradients and stepping
-    optimiser at the end. Returns dict of loss components.
+    """Token-embedding-level FreeLB step (chapter 4 Algorithm 4.2 v2).
 
-    Implements §4.4 Algorithm 4.2 with a single-backward-per-iteration
-    pattern that avoids "backward through graph twice" errors:
-      - encode three views once (encoder graph kept alive across K iters)
-      - K-1 iterations: scaled adv-loss.backward(retain_graph=True), update δ
-      - last iteration: combine final adv-loss + clean-loss into one
-        backward() (no retain_graph; graph is freed exactly once)
+    Earlier version perturbed encoder OUTPUTS (post-Transformer
+    representations). Empirically that didn't help against WAFamole-style
+    discrete attacks because the perturbation lives in a different space
+    from the actual attacks. This rewrite injects δ at the *token
+    embedding* layer, before the Transformer — closer to the discrete
+    operator-driven perturbations WAFamole produces.
+
+    Per-iteration pattern (single-backward to avoid graph reuse errors):
+      - look up base token embeddings for all three views (no transformer
+        forward yet; δ added directly to these)
+      - K-1 inner steps: forward (encoders + fusion) on perturbed embeds,
+        scaled adv-loss.backward(retain_graph=True), update δ in ε-ball
+      - last step: combine final adv-loss + clean-loss into one backward()
       - optimizer.step()
     """
     optimizer.zero_grad(set_to_none=True)
 
-    # ---- Stage 1: encode views ONCE (grad on encoder params) ----
-    H_S, H_C, H_L, aux = model.encode_views(
-        surface_ids=batch["surface_ids"], surface_mask=batch["surface_mask"],
-        lex_ids=batch["lex_ids"], lex_mask=batch["lex_mask"],
-        char_ids=batch.get("char_ids"), char_mask=batch.get("char_mask"),
-    )
     labels = batch["labels"].float()
     sm = batch["surface_mask"]; lm = batch["lex_mask"]; cm = batch.get("char_mask")
+    if cm is None and batch.get("char_ids") is not None:
+        cm = (batch["char_ids"] != 0).long()
 
-    # ---- Initialise δ as small random tensors with requires_grad ----
-    def _rand_delta(H, eps):
-        d = torch.randn_like(H) * eps * 0.1
+    # ---- Look up base token embeddings (no requires_grad path on params,
+    #      we still want gradients to flow into token_emb during backward) ----
+    e_S_base = model.surface_enc.token_emb(batch["surface_ids"])    # [B, T_S, d_surface]
+    e_C_base = model.char_enc.token_emb(batch["char_ids"])           # [B, T_C, d_fusion]
+    e_L_base = model.lex_enc.token_emb(batch["lex_ids"])             # [B, T_L, d_fusion]
+
+    # ---- Initialise δ as small random tensors in the per-sample ε-ball ----
+    def _rand_delta(E, eps):
+        d = torch.randn_like(E) * eps * 0.1
         norm = d.view(d.size(0), -1).norm(dim=-1).view(-1, 1, 1).clamp(min=1e-8)
         d = d * (eps / norm).clamp(max=1.0)
         return d.detach().requires_grad_(True)
 
-    delta_S = _rand_delta(H_S, epsilon)
-    delta_C = _rand_delta(H_C, epsilon)
-    delta_L = _rand_delta(H_L, epsilon)
+    delta_S = _rand_delta(e_S_base, epsilon)
+    delta_C = _rand_delta(e_C_base, epsilon)
+    delta_L = _rand_delta(e_L_base, epsilon)
 
     def _project_and_step(d):
         if d.grad is None:
@@ -175,40 +183,52 @@ def freelb_step(model, batch, K: int, epsilon: float, alpha: float,
             d.mul_((epsilon / dnorm).clamp(max=1.0))
             d.grad.zero_()
 
-    adv_losses: list[float] = []
-
-    # ---- K-1 inner adv-backward steps, each retaining graph ----
-    for k in range(max(K - 1, 0)):
-        fused = model.fuse_from_views(
-            H_S + delta_S, H_C + delta_C, H_L + delta_L,
+    def _fwd_with_perturb():
+        """Full forward with perturbed token embeddings."""
+        H_S, H_C, H_L, _aux = model.encode_views(
+            surface_mask=sm, lex_mask=lm, char_mask=cm,
+            surface_inputs_embeds=e_S_base + delta_S,
+            char_inputs_embeds=e_C_base + delta_C,
+            lex_inputs_embeds=e_L_base + delta_L,
+        )
+        return model.fuse_from_views(
+            H_S, H_C, H_L,
             surface_mask=sm, lex_mask=lm, char_mask=cm,
             view_dropout_prob=view_dropout_prob,
         )
+
+    def _fwd_clean():
+        H_S, H_C, H_L, _aux = model.encode_views(
+            surface_ids=batch["surface_ids"], surface_mask=sm,
+            lex_ids=batch["lex_ids"], lex_mask=lm,
+            char_ids=batch.get("char_ids"), char_mask=cm,
+        )
+        return model.fuse_from_views(
+            H_S, H_C, H_L,
+            surface_mask=sm, lex_mask=lm, char_mask=cm,
+            view_dropout_prob=view_dropout_prob,
+        )
+
+    adv_losses: list[float] = []
+
+    # ---- K-1 inner adv-backward steps, each retaining graph for next iter ----
+    for k in range(max(K - 1, 0)):
+        fused = _fwd_with_perturb()
         loss_adv_k = F.binary_cross_entropy_with_logits(fused["p_main"], labels)
         adv_losses.append(float(loss_adv_k.detach().item()))
-        # Backward this step's contribution: (λ/K) · L_adv_k
         (loss_adv_k * (lambda_adv / max(K, 1))).backward(retain_graph=True)
         _project_and_step(delta_S)
         _project_and_step(delta_C)
         _project_and_step(delta_L)
 
     # ---- Final combined backward: last-step adv loss + clean loss ----
-    fused_last = model.fuse_from_views(
-        H_S + delta_S, H_C + delta_C, H_L + delta_L,
-        surface_mask=sm, lex_mask=lm, char_mask=cm,
-        view_dropout_prob=view_dropout_prob,
-    )
+    fused_last = _fwd_with_perturb()
     loss_adv_last = F.binary_cross_entropy_with_logits(fused_last["p_main"], labels)
     adv_losses.append(float(loss_adv_last.detach().item()))
 
-    fused_clean = model.fuse_from_views(
-        H_S, H_C, H_L,
-        surface_mask=sm, lex_mask=lm, char_mask=cm,
-        view_dropout_prob=view_dropout_prob,
-    )
+    fused_clean = _fwd_clean()
     loss_clean = F.binary_cross_entropy_with_logits(fused_clean["p_main"], labels)
 
-    # Single combined backward — last walk through encoder graph, then freed.
     total_grad_loss = loss_clean + (lambda_adv / max(K, 1)) * loss_adv_last
     total_grad_loss.backward()
 
